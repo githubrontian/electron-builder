@@ -1,5 +1,9 @@
-import { Arch, archFromString, ArchType, log } from "builder-util"
-import { Publish } from "builder-util-runtime"
+import { Arch, archFromString, ArchType } from "builder-util"
+import { AllPublishOptions } from "builder-util-runtime"
+import { SnapStoreOptions } from "./publish/SnapStorePublisher"
+
+// https://github.com/YousefED/typescript-json-schema/issues/80
+export type Publish = AllPublishOptions | SnapStoreOptions | Array<AllPublishOptions | SnapStoreOptions> | null
 
 export type TargetConfigType = Array<string | TargetConfiguration> | string | TargetConfiguration | null
 
@@ -73,11 +77,6 @@ export abstract class Target {
   abstract readonly options: TargetSpecificOptions | null | undefined
 
   protected constructor(readonly name: string, readonly isAsyncSupported: boolean = true) {
-  }
-
-  // noinspection JSMethodCanBeStatic
-  protected logBuilding(targetPresentableName: string, artifactPath: string, arch: Arch): void {
-    log.info({target: targetPresentableName, arch: Arch[arch], file: log.filePath(artifactPath)}, "building")
   }
 
   async checkOptions(): Promise<any> {

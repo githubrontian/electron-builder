@@ -2,44 +2,25 @@ import { serializeToYaml, TmpDir, executeAppBuilder } from "builder-util"
 import { BintrayOptions, GenericServerOptions, GithubOptions, S3Options, SpacesOptions, DownloadOptions } from "builder-util-runtime"
 import { AppUpdater, NoOpLogger } from "electron-updater"
 import { MacUpdater } from "electron-updater/out/MacUpdater"
-import { outputFile } from "fs-extra-p"
-import { tmpdir } from "os"
+import { outputFile } from "fs-extra"
 import * as path from "path"
+import { TestOnlyUpdaterOptions } from "electron-updater/out/AppUpdater"
+import { NsisUpdater } from "electron-updater/out/NsisUpdater"
+import { TestAppAdapter } from "./TestAppAdapter"
 import { assertThat } from "./fileAssert"
 import { NodeHttpExecutor } from "builder-util/out/nodeHttpExecutor"
 
 const tmpDir = new TmpDir("updater-test-util")
 
-export function createTestApp(version: string, appPath = "") {
-  class MockApp {
-    // noinspection JSMethodCanBeStatic,JSUnusedGlobalSymbols
-    getVersion() {
-      return version
-    }
+export async function createTestAppAdapter(version: string = "0.0.1") {
+  return new TestAppAdapter(version, await tmpDir.getTempDir())
+}
 
-    // noinspection JSMethodCanBeStatic,JSUnusedGlobalSymbols
-    getAppPath() {
-      return appPath
-    }
-
-    // noinspection JSMethodCanBeStatic,JSUnusedGlobalSymbols
-    getPath(type: string) {
-      return path.join(process.env.ELECTRON_BUILDER_TMP_DIR || tmpdir(), "electron-updater-test", type)
-    }
-
-    on() {
-      // ignored
-    }
-
-    once() {
-      // ignored
-    }
-
-    isReady() {
-      return true
-    }
-  }
-  return new MockApp()
+export async function createNsisUpdater(version: string = "0.0.1") {
+  const testAppAdapter = await createTestAppAdapter(version)
+  const result = new NsisUpdater(null, testAppAdapter)
+  await tuneTestUpdater(result)
+  return result
 }
 
 // to reduce difference in test mode, setFeedURL is not used to set (NsisUpdater also read configOnDisk to load original publisherName)
@@ -50,7 +31,6 @@ export async function writeUpdateConfig<T extends GenericServerOptions | GithubO
 }
 
 export async function validateDownload(updater: AppUpdater, expectDownloadPromise = true) {
-  tuneTestUpdater(updater)
   const actualEvents = trackEvents(updater)
 
   const updateCheckResult = await updater.checkForUpdates()
@@ -63,6 +43,7 @@ export async function validateDownload(updater: AppUpdater, expectDownloadPromis
 
   expect(updateCheckResult.updateInfo).toMatchSnapshot()
   if (expectDownloadPromise) {
+    // noinspection JSIgnoredPromiseFromCall
     expect(updateCheckResult.downloadPromise).toBeDefined()
     const downloadResult = await updateCheckResult.downloadPromise
     if (updater instanceof MacUpdater) {
@@ -73,6 +54,7 @@ export async function validateDownload(updater: AppUpdater, expectDownloadPromis
     }
   }
   else {
+    // noinspection JSIgnoredPromiseFromCall
     expect(updateCheckResult.downloadPromise).toBeUndefined()
   }
 
@@ -93,8 +75,12 @@ export class TestNodeHttpExecutor extends NodeHttpExecutor {
 
 export const httpExecutor: TestNodeHttpExecutor = new TestNodeHttpExecutor()
 
-export function tuneTestUpdater(updater: AppUpdater) {
-  (updater as any).httpExecutor = httpExecutor
+export async function tuneTestUpdater(updater: AppUpdater, options?: TestOnlyUpdaterOptions) {
+  (updater as any).httpExecutor = httpExecutor;
+  (updater as any)._testOnlyOptions = {
+    platform: "win32",
+    ...options,
+  }
   updater.logger = new NoOpLogger()
 }
 

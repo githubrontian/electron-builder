@@ -1,11 +1,11 @@
 import BluebirdPromise from "bluebird-lst"
 import { Arch, log, deepAssign } from "builder-util"
 import { UUID } from "builder-util-runtime"
-import { getBinFromGithub } from "../binDownload"
+import { getBinFromUrl } from "../binDownload"
 import { walk } from "builder-util/out/fs"
 import { createHash } from "crypto"
 import * as ejs from "ejs"
-import { readFile, writeFile } from "fs-extra-p"
+import { readFile, writeFile } from "fs-extra"
 import { Lazy } from "lazy-val"
 import * as path from "path"
 import { MsiOptions } from "../"
@@ -42,9 +42,13 @@ export default class MsiTarget extends Target {
 
   async build(appOutDir: string, arch: Arch) {
     const packager = this.packager
-    const artifactName = packager.expandArtifactNamePattern(this.options, "msi", arch)
+    const artifactName = packager.expandArtifactBeautyNamePattern(this.options, "msi", arch)
     const artifactPath = path.join(this.outDir, artifactName)
-    this.logBuilding("MSI", artifactPath, arch)
+    await packager.info.callArtifactBuildStarted({
+      targetPresentableName: "MSI",
+      file: artifactPath,
+      arch,
+    })
 
     const stageDir = await createStageDir(this, packager, arch)
     const vm = this.vm
@@ -67,11 +71,11 @@ export default class MsiTarget extends Target {
     }
 
     // noinspection SpellCheckingInspection
-    const vendorPath = await getBinFromGithub("wix", "4.0.0.5512.2", "/X5poahdCc3199Vt6AP7gluTlT1nxi9cbbHhZhCMEu+ngyP1LiBMn+oZX7QAZVaKeBMc2SjVp7fJqNLqsUnPNQ==")
+    const vendorPath = await getBinFromUrl("wix", "4.0.0.5512.2", "/X5poahdCc3199Vt6AP7gluTlT1nxi9cbbHhZhCMEu+ngyP1LiBMn+oZX7QAZVaKeBMc2SjVp7fJqNLqsUnPNQ==")
 
     // noinspection SpellCheckingInspection
     const candleArgs = [
-      "-arch", arch === Arch.ia32 ? "x86" : (arch === Arch.armv7l ? "arm" : "x64"),
+      "-arch", arch === Arch.ia32 ? "x86" : (arch === Arch.arm64 ? "arm64" : "x64"),
       `-dappDir=${vm.toVmFile(appOutDir)}`,
     ].concat(this.getCommonWixArgs())
     candleArgs.push("project.wxs")
@@ -88,7 +92,7 @@ export default class MsiTarget extends Target {
 
     await packager.sign(artifactPath)
 
-    packager.info.dispatchArtifactCreated({
+    await packager.info.callArtifactBuildCompleted({
       file: artifactPath,
       packager,
       arch,
@@ -233,7 +237,7 @@ export default class MsiTarget extends Target {
         result += `${fileSpace}</File>`
 
         if (hasMenuCategory) {
-          result += `<RemoveFolder Id="${startMenuShortcutDirectoryId}" On="uninstall"/>\n`
+          result += `<RemoveFolder Id="${startMenuShortcutDirectoryId}" Directory="${startMenuShortcutDirectoryId}" On="uninstall"/>\n`
         }
       }
       else {

@@ -1,5 +1,5 @@
 import { Filter, FileConsumer } from "builder-util/out/fs"
-import { readlink, stat, Stats } from "fs-extra-p"
+import { readlink, stat, Stats } from "fs-extra"
 import { FileMatcher } from "../fileMatcher"
 import { Packager } from "../packager"
 import * as path from "path"
@@ -80,6 +80,7 @@ export class AppFileWalker extends FileCopyHelper implements FileConsumer {
   }
 
   // noinspection JSUnusedGlobalSymbols
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   consume(file: string, fileStat: Stats, parent: string, siblingNames: Array<string>): any {
     if (fileStat.isDirectory()) {
       // https://github.com/electron-userland/electron-builder/issues/1539

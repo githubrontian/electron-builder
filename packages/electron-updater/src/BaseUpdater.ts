@@ -1,23 +1,21 @@
 import { AllPublishOptions } from "builder-util-runtime"
+import { AppAdapter } from "./AppAdapter"
 import { AppUpdater, DownloadExecutorTask } from "./AppUpdater"
-import { UPDATE_DOWNLOADED } from "./main"
 
 export abstract class BaseUpdater extends AppUpdater {
   protected quitAndInstallCalled = false
   private quitHandlerAdded = false
 
-  protected constructor(options?: AllPublishOptions | null, app?: any) {
+  protected constructor(options?: AllPublishOptions | null, app?: AppAdapter) {
     super(options, app)
   }
 
-  async quitAndInstall(isSilent: boolean = false, isForceRunAfter: boolean = false): Promise<void> {
+  quitAndInstall(isSilent = false, isForceRunAfter = false): void {
     this._logger.info(`Install on explicit quitAndInstall`)
-    const isInstalled = await this.install(isSilent, isSilent ? isForceRunAfter : true)
+    const isInstalled = this.install(isSilent, isSilent ? isForceRunAfter : true)
     if (isInstalled) {
       setImmediate(() => {
-        if (this.app.quit !== undefined) {
-          this.app.quit()
-        }
+        this.app.quit()
       })
     }
     else {
@@ -28,25 +26,27 @@ export abstract class BaseUpdater extends AppUpdater {
   protected executeDownload(taskOptions: DownloadExecutorTask): Promise<Array<string>> {
     return super.executeDownload({
       ...taskOptions,
-      done: async () => {
-        this.emit(UPDATE_DOWNLOADED, taskOptions.downloadUpdateOptions.updateInfo)
+      done: async event => {
+        this.dispatchUpdateDownloaded(event)
         this.addQuitHandler()
       }
     })
   }
 
-  protected abstract doInstall(installerPath: string, isSilent: boolean, isRunAfter: boolean): Promise<boolean>
+  // must be sync
+  protected abstract doInstall(options: InstallOptions): boolean
 
-  protected async install(isSilent: boolean, isRunAfter: boolean): Promise<boolean> {
+  // must be sync (because quit even handler is not async)
+  protected install(isSilent: boolean, isForceRunAfter: boolean): boolean {
     if (this.quitAndInstallCalled) {
       this._logger.warn("install call ignored: quitAndInstallCalled is set to true")
       return false
     }
 
-    const installerPath = this.downloadedUpdateHelper.file
-    // todo check (for now it is ok to no check as before, cached (from previous launch) update file checked in any case)
-    // const isValid = await this.isUpdateValid(installerPath)
-    if (installerPath == null) {
+    const downloadedUpdateHelper = this.downloadedUpdateHelper
+    const installerPath = downloadedUpdateHelper == null ? null : downloadedUpdateHelper.file
+    const downloadedFileInfo = downloadedUpdateHelper == null ? null : downloadedUpdateHelper.downloadedFileInfo
+    if (installerPath == null || downloadedFileInfo == null) {
       this.dispatchError(new Error("No valid update available, can't quit and install"))
       return false
     }
@@ -55,8 +55,13 @@ export abstract class BaseUpdater extends AppUpdater {
     this.quitAndInstallCalled = true
 
     try {
-      this._logger.info(`Install: isSilent: ${isSilent}, isRunAfter: ${isRunAfter}`)
-      return await this.doInstall(installerPath, isSilent, isRunAfter)
+      this._logger.info(`Install: isSilent: ${isSilent}, isForceRunAfter: ${isForceRunAfter}`)
+      return this.doInstall({
+        installerPath,
+        isSilent,
+        isForceRunAfter,
+        isAdminRightsRequired: downloadedFileInfo.isAdminRightsRequired,
+      })
     }
     catch (e) {
       this.dispatchError(e)
@@ -64,21 +69,33 @@ export abstract class BaseUpdater extends AppUpdater {
     }
   }
 
-  protected addQuitHandler() {
+  protected addQuitHandler(): void {
     if (this.quitHandlerAdded || !this.autoInstallOnAppQuit) {
       return
     }
 
     this.quitHandlerAdded = true
 
-    this.app.once("quit", async () => {
-      if (!this.quitAndInstallCalled) {
-        this._logger.info("Auto install update on quit")
-        await this.install(true, false)
-      }
-      else {
+    this.app.onQuit(exitCode => {
+      if (this.quitAndInstallCalled) {
         this._logger.info("Update installer has already been triggered. Quitting application.")
+        return
       }
+
+      if (exitCode !== 0) {
+        this._logger.info(`Update will be not installed on quit because application is quitting with exit code ${exitCode}`)
+        return
+      }
+
+      this._logger.info("Auto install update on quit")
+      this.install(true, false)
     })
   }
+}
+
+export interface InstallOptions {
+  readonly installerPath: string
+  readonly isSilent: boolean
+  readonly isForceRunAfter: boolean
+  readonly isAdminRightsRequired: boolean
 }

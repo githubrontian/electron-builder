@@ -1,13 +1,29 @@
-import { isEmptyOrSpaces, log, smarten } from "builder-util"
+import { isEmptyOrSpaces, log } from "builder-util"
 import sanitizeFileName from "sanitize-filename"
 import { prerelease, SemVer } from "semver"
 import { PlatformSpecificBuildOptions } from "./options/PlatformSpecificBuildOptions"
 import { Packager } from "./packager"
 import { expandMacro } from "./util/macroExpander"
 
+// fpm bug - rpm build --description is not escaped, well... decided to replace quite to smart quote
+// http://leancrew.com/all-this/2010/11/smart-quotes-in-javascript/
+export function smarten(s: string): string {
+  // opening singles
+  s = s.replace(/(^|[-\u2014\s(["])'/g, "$1\u2018")
+  // closing singles & apostrophes
+  s = s.replace(/'/g, "\u2019")
+  // opening doubles
+  s = s.replace(/(^|[-\u2014/[(\u2018\s])"/g, "$1\u201c")
+  // closing doubles
+  s = s.replace(/"/g, "\u201d")
+  return s
+}
+
 export class AppInfo {
   readonly description = smarten(this.info.metadata.description || "")
   readonly version: string
+  readonly shortVersion: string | undefined
+  readonly shortVersionWindows: string | undefined
 
   readonly buildNumber: string | undefined
   readonly buildVersion: string
@@ -22,7 +38,7 @@ export class AppInfo {
       buildVersion = info.config.buildVersion
     }
 
-    this.buildNumber = process.env.BUILD_NUMBER || process.env.TRAVIS_BUILD_NUMBER || process.env.APPVEYOR_BUILD_NUMBER || process.env.CIRCLE_BUILD_NUM || process.env.BUILD_BUILDNUMBER
+    this.buildNumber = process.env.BUILD_NUMBER || process.env.TRAVIS_BUILD_NUMBER || process.env.APPVEYOR_BUILD_NUMBER || process.env.CIRCLE_BUILD_NUM || process.env.BUILD_BUILDNUMBER || process.env.CI_PIPELINE_IID
     if (buildVersion == null) {
       buildVersion = this.version
       if (!isEmptyOrSpaces(this.buildNumber)) {
@@ -30,6 +46,13 @@ export class AppInfo {
       }
     }
     this.buildVersion = buildVersion
+
+    if (info.metadata.shortVersion) {
+      this.shortVersion = info.metadata.shortVersion
+    }
+    if (info.metadata.shortVersionWindows) {
+      this.shortVersionWindows = info.metadata.shortVersionWindows
+    }
 
     this.productName = info.config.productName || info.metadata.productName || info.metadata.name!!
     this.productFilename = sanitizeFileName(this.productName)
@@ -102,6 +125,10 @@ export class AppInfo {
     return sanitizeFileName(this.name)
   }
 
+  get updaterCacheDirName(): string {
+    return this.sanitizedName.toLowerCase() + "-updater"
+  }
+
   get copyright(): string {
     const copyright = this.info.config.copyright
     if (copyright != null) {
@@ -117,7 +144,7 @@ export class AppInfo {
     }
 
     const info = await this.info.repositoryInfo
-    return info == null || info.type !== "github"  ? null : `https://${info.domain}/${info.user}/${info.project}`
+    return info == null || info.type !== "github" ? null : `https://${info.domain}/${info.user}/${info.project}`
   }
 }
 

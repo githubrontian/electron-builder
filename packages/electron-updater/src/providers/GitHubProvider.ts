@@ -1,26 +1,30 @@
-import { CancellationToken, GithubOptions, githubUrl, HttpError, HttpExecutor, newError, parseXml, ReleaseNoteInfo, UpdateInfo, XElement } from "builder-util-runtime"
+import { CancellationToken, GithubOptions, githubUrl, HttpError, newError, parseXml, ReleaseNoteInfo, UpdateInfo, XElement } from "builder-util-runtime"
 import * as semver from "semver"
 import { URL } from "url"
 import { AppUpdater } from "../AppUpdater"
-import { getChannelFilename, getDefaultChannelName, isUseOldMacProvider, newBaseUrl, newUrlFromBase, Provider, ResolvedUpdateFileInfo } from "../main"
-import { parseUpdateInfo, resolveFiles } from "./Provider"
+import { getChannelFilename, newBaseUrl, newUrlFromBase, Provider, ResolvedUpdateFileInfo } from "../main"
+import { parseUpdateInfo, ProviderRuntimeOptions, resolveFiles } from "./Provider"
 
-const hrefRegExp = /\/tag\/v?([^\/]+)$/
+const hrefRegExp = /\/tag\/v?([^/]+)$/
 
 export abstract class BaseGitHubProvider<T extends UpdateInfo> extends Provider<T> {
   // so, we don't need to parse port (because node http doesn't support host as url does)
   protected readonly baseUrl: URL
   protected readonly baseApiUrl: URL
 
-  protected constructor(protected readonly options: GithubOptions, defaultHost: string, executor: HttpExecutor<any>) {
-    super(executor, false /* because GitHib uses S3 */)
+  protected constructor(protected readonly options: GithubOptions, defaultHost: string, runtimeOptions: ProviderRuntimeOptions) {
+    super({
+      ...runtimeOptions,
+      /* because GitHib uses S3 */
+      isUseMultipleRangeRequest: false,
+    })
 
     this.baseUrl = newBaseUrl(githubUrl(options, defaultHost))
     const apiHost = defaultHost === "github.com" ? "api.github.com" : defaultHost
     this.baseApiUrl = newBaseUrl(githubUrl(options, apiHost))
   }
 
-  protected computeGithubBasePath(result: string) {
+  protected computeGithubBasePath(result: string): string {
     // https://github.com/electron-userland/electron-builder/issues/1903#issuecomment-320881211
     const host = this.options.host
     return host != null && host !== "github.com" && host !== "api.github.com" ? `/api/v3${result}` : result
@@ -28,8 +32,8 @@ export abstract class BaseGitHubProvider<T extends UpdateInfo> extends Provider<
 }
 
 export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
-  constructor(protected readonly options: GithubOptions, private readonly updater: AppUpdater, executor: HttpExecutor<any>) {
-    super(options, "github.com", executor)
+  constructor(protected readonly options: GithubOptions, private readonly updater: AppUpdater, runtimeOptions: ProviderRuntimeOptions) {
+    super(options, "github.com", runtimeOptions)
   }
 
   async getLatestVersion(): Promise<UpdateInfo> {
@@ -55,7 +59,6 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
             break
           }
         }
-
       }
     }
     catch (e) {
@@ -66,7 +69,7 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
       throw newError(`No published versions on GitHub`, "ERR_UPDATER_NO_PUBLISHED_VERSIONS")
     }
 
-    const channelFile = getChannelFilename(getDefaultChannelName())
+    const channelFile = getChannelFilename(this.getDefaultChannelName())
     const channelFileUrl = newUrlFromBase(this.getBaseDownloadPath(version, channelFile), this.baseUrl)
     const requestOptions = this.createRequestOptions(channelFileUrl)
     let rawData: string
@@ -81,10 +84,6 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     }
 
     const result = parseUpdateInfo(rawData, channelFile, channelFileUrl)
-    if (isUseOldMacProvider()) {
-      (result as any).releaseJsonUrl = `${githubUrl(this.options)}/${requestOptions.path}`
-    }
-
     if (result.releaseName == null) {
       result.releaseName = latestRelease.elementValueOrEmpty("title")
     }
@@ -115,7 +114,7 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     }
   }
 
-  private get basePath() {
+  private get basePath(): string {
     return `/${this.options.owner}/${this.options.repo}/releases`
   }
 
@@ -124,7 +123,7 @@ export class GitHubProvider extends BaseGitHubProvider<UpdateInfo> {
     return resolveFiles(updateInfo, this.baseUrl, p => this.getBaseDownloadPath(updateInfo.version, p.replace(/ /g, "-")))
   }
 
-  private getBaseDownloadPath(version: string, fileName: string) {
+  private getBaseDownloadPath(version: string, fileName: string): string {
     return `${this.basePath}/download/${this.options.vPrefixedTagName === false ? "" : "v"}${version}/${fileName}`
   }
 }
@@ -139,7 +138,7 @@ function getNoteValue(parent: XElement): string {
   return result === "No content." ? "" : result
 }
 
-export function computeReleaseNotes(currentVersion: semver.SemVer, isFullChangelog: boolean, feed: XElement, latestRelease: any) {
+export function computeReleaseNotes(currentVersion: semver.SemVer, isFullChangelog: boolean, feed: XElement, latestRelease: any): string | Array<ReleaseNoteInfo> | null {
   if (!isFullChangelog) {
     return getNoteValue(latestRelease)
   }
@@ -147,7 +146,7 @@ export function computeReleaseNotes(currentVersion: semver.SemVer, isFullChangel
   const releaseNotes: Array<ReleaseNoteInfo> = []
   for (const release of feed.getElements("entry")) {
     // noinspection TypeScriptValidateJSTypes
-    const versionRelease = release.element("link").attribute("href").match(/\/tag\/v?([^\/]+)$/)![1]
+    const versionRelease = release.element("link").attribute("href").match(/\/tag\/v?([^/]+)$/)![1]
     if (semver.lt(currentVersion, versionRelease)) {
       releaseNotes.push({
         version: versionRelease,

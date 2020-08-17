@@ -1,14 +1,13 @@
 import BluebirdPromise from "bluebird-lst"
 import { asArray, getPlatformIconFileName, InvalidConfigurationError, log } from "builder-util"
 import { copyOrLinkFile, unlinkIfExists } from "builder-util/out/fs"
-import { orIfFileNotExist } from "builder-util/out/promise"
-import { readFile, rename, utimes, writeFile } from "fs-extra-p"
+import { rename, utimes } from "fs-extra"
 import * as path from "path"
-import { build as buildPlist, parse as parsePlist } from "plist"
 import { filterCFBundleIdentifier } from "../appInfo"
 import { AsarIntegrity } from "../asar/integrity"
 import MacPackager from "../macPackager"
 import { normalizeExt } from "../platformPackager"
+import { executeAppBuilderAndWriteJson, executeAppBuilderAsJson } from "../util/appBuilder"
 
 function doRename(basePath: string, oldName: string, newName: string) {
   return rename(path.join(basePath, oldName), path.join(basePath, newName))
@@ -22,7 +21,8 @@ function moveHelpers(helperSuffixes: Array<string>, frameworksPath: string, appN
   })
 }
 
-function getAvailableHelperSuffixes(helperEHPlist: string | null, helperNPPlist: string | null) {
+function getAvailableHelperSuffixes(helperEHPlist: string | null, helperNPPlist: string | null, helperRendererPlist: string | null, helperPluginPlist: string | null, helperGPUPlist: string | null) {
+
   const result = [" Helper"]
   if (helperEHPlist != null) {
     result.push(" Helper EH")
@@ -30,11 +30,20 @@ function getAvailableHelperSuffixes(helperEHPlist: string | null, helperNPPlist:
   if (helperNPPlist != null) {
     result.push(" Helper NP")
   }
+  if (helperRendererPlist != null) {
+    result.push(" Helper (Renderer)")
+  }
+  if (helperPluginPlist != null) {
+    result.push(" Helper (Plugin)")
+  }
+  if (helperGPUPlist != null) {
+    result.push(" Helper (GPU)")
+  }
   return result
 }
 
 /** @internal */
-export async function createMacApp(packager: MacPackager, appOutDir: string, asarIntegrity: AsarIntegrity | null) {
+export async function createMacApp(packager: MacPackager, appOutDir: string, asarIntegrity: AsarIntegrity | null, isMas: boolean) {
   const appInfo = packager.appInfo
   const appFilename = appInfo.productFilename
 
@@ -43,30 +52,42 @@ export async function createMacApp(packager: MacPackager, appOutDir: string, asa
   const loginItemPath = path.join(contentsPath, "Library", "LoginItems")
 
   const appPlistFilename = path.join(contentsPath, "Info.plist")
-  const helperPlistFilename = path.join(frameworksPath, `${packager.electronDistMacOsExecutableName} Helper.app`, "Contents", "Info.plist")
-  const helperEHPlistFilename = path.join(frameworksPath, `${packager.electronDistMacOsExecutableName} Helper EH.app`, "Contents", "Info.plist")
-  const helperNPPlistFilename = path.join(frameworksPath, `${packager.electronDistMacOsExecutableName} Helper NP.app`, "Contents", "Info.plist")
-  const helperLoginPlistFilename = path.join(loginItemPath, `${packager.electronDistMacOsExecutableName} Login Helper.app`, "Contents", "Info.plist")
+  const helperPlistFilename = path.join(frameworksPath, "Electron Helper.app", "Contents", "Info.plist")
+  const helperEHPlistFilename = path.join(frameworksPath, "Electron Helper EH.app", "Contents", "Info.plist")
+  const helperNPPlistFilename = path.join(frameworksPath, "Electron Helper NP.app", "Contents", "Info.plist")
+  const helperRendererPlistFilename = path.join(frameworksPath, "Electron Helper (Renderer).app", "Contents", "Info.plist")
+  const helperPluginPlistFilename = path.join(frameworksPath, "Electron Helper (Plugin).app", "Contents", "Info.plist")
+  const helperGPUPlistFilename = path.join(frameworksPath, "Electron Helper (GPU).app", "Contents", "Info.plist")
+  const helperLoginPlistFilename = path.join(loginItemPath, "Electron Login Helper.app", "Contents", "Info.plist")
 
-  const buildMetadata = packager.config!
-  const fileContents: Array<string | null> = await BluebirdPromise.map([
-    appPlistFilename,
-    helperPlistFilename,
-    helperEHPlistFilename,
-    helperNPPlistFilename,
-    helperLoginPlistFilename,
-    (buildMetadata as any)["extend-info"]
-  ], it => it == null ? it : orIfFileNotExist(readFile(it, "utf8"), null))
-  const appPlist = parsePlist(fileContents[0]!!)
-  const helperPlist = parsePlist(fileContents[1]!!)
-  const helperEHPlist = fileContents[2] == null ? null : parsePlist(fileContents[2]!!)
-  const helperNPPlist = fileContents[3] == null ? null : parsePlist(fileContents[3]!!)
-  const helperLoginPlist = fileContents[4] == null ? null : parsePlist(fileContents[4]!!)
+  const plistContent: Array<any> = await executeAppBuilderAsJson(["decode-plist", "-f", appPlistFilename, "-f", helperPlistFilename, "-f", helperEHPlistFilename, "-f", helperNPPlistFilename, "-f", helperRendererPlistFilename, "-f", helperPluginPlistFilename, "-f", helperGPUPlistFilename, "-f", helperLoginPlistFilename])
+
+  if (plistContent[0] == null) {
+    throw new Error("corrupted Electron dist")
+  }
+
+  const appPlist = plistContent[0]!!
+  const helperPlist = plistContent[1]!!
+  const helperEHPlist = plistContent[2]
+  const helperNPPlist = plistContent[3]
+  const helperRendererPlist = plistContent[4]
+  const helperPluginPlist = plistContent[5]
+  const helperGPUPlist = plistContent[6]
+  const helperLoginPlist = plistContent[7]
 
   // if an extend-info file was supplied, copy its contents in first
-  if (fileContents[5] != null) {
-    Object.assign(appPlist, parsePlist(fileContents[5]!!))
+  if (plistContent[8] != null) {
+    Object.assign(appPlist, plistContent[8])
   }
+
+  const buildMetadata = packager.config!!
+
+  /**
+   * Configure bundleIdentifier for the generic Electron Helper process
+   *
+   * This was the only Helper in Electron 5 and before. Allow users to configure
+   * the bundleIdentifier for continuity.
+   */
 
   const oldHelperBundleId = (buildMetadata as any)["helper-bundle-id"]
   if (oldHelperBundleId != null) {
@@ -76,23 +97,48 @@ export async function createMacApp(packager: MacPackager, appOutDir: string, asa
 
   await packager.applyCommonInfo(appPlist, contentsPath)
 
+  // required for electron-updater proxy
+  if (!isMas) {
+    configureLocalhostAts(appPlist)
+  }
+
   helperPlist.CFBundleExecutable = `${appFilename} Helper`
   helperPlist.CFBundleDisplayName = `${appInfo.productName} Helper`
   helperPlist.CFBundleIdentifier = helperBundleIdentifier
   helperPlist.CFBundleVersion = appPlist.CFBundleVersion
 
-  function configureHelper(helper: any, postfix: string) {
+  /**
+   * Configure bundleIdentifier for Electron 5+ Helper processes
+   *
+   * In Electron 6, parts of the generic Electron Helper process were split into
+   * individual helper processes. Allow users to configure the bundleIdentifiers
+   * for continuity, specifically because macOS keychain access relies on
+   * bundleIdentifiers not changing (i.e. across versions of Electron).
+   */
+
+  function configureHelper(helper: any, postfix: string, userProvidedBundleIdentifier?: string | null) {
     helper.CFBundleExecutable = `${appFilename} Helper ${postfix}`
     helper.CFBundleDisplayName = `${appInfo.productName} Helper ${postfix}`
-    helper.CFBundleIdentifier = `${helperBundleIdentifier}.${postfix}`
+    helper.CFBundleIdentifier = userProvidedBundleIdentifier
+      ? filterCFBundleIdentifier(userProvidedBundleIdentifier)
+      : `${helperBundleIdentifier}.${postfix.replace(/[^a-z0-9]/gim, "")}`
     helper.CFBundleVersion = appPlist.CFBundleVersion
   }
 
+  if (helperRendererPlist != null) {
+    configureHelper(helperRendererPlist, "(Renderer)", packager.platformSpecificBuildOptions.helperRendererBundleId)
+  }
+  if (helperPluginPlist != null) {
+    configureHelper(helperPluginPlist, "(Plugin)", packager.platformSpecificBuildOptions.helperPluginBundleId)
+  }
+  if (helperGPUPlist != null) {
+    configureHelper(helperGPUPlist, "(GPU)", packager.platformSpecificBuildOptions.helperGPUBundleId)
+  }
   if (helperEHPlist != null) {
-    configureHelper(helperEHPlist, "EH")
+    configureHelper(helperEHPlist, "EH", packager.platformSpecificBuildOptions.helperEHBundleId)
   }
   if (helperNPPlist != null) {
-    configureHelper(helperNPPlist, "NP")
+    configureHelper(helperNPPlist, "NP", packager.platformSpecificBuildOptions.helperNPBundleId)
   }
   if (helperLoginPlist != null) {
     helperLoginPlist.CFBundleExecutable = `${appFilename} Login Helper`
@@ -132,6 +178,7 @@ export async function createMacApp(packager: MacPackager, appOutDir: string, asa
         CFBundleTypeExtensions: extensions,
         CFBundleTypeName: fileAssociation.name || extensions[0],
         CFBundleTypeRole: fileAssociation.role || "Editor",
+        LSHandlerRank: fileAssociation.rank || "Default",
         CFBundleTypeIconFile: iconFile
       } as any
 
@@ -146,21 +193,40 @@ export async function createMacApp(packager: MacPackager, appOutDir: string, asa
     appPlist.AsarIntegrity = JSON.stringify(asarIntegrity)
   }
 
+  const plistDataToWrite: any = {
+    [appPlistFilename]: appPlist,
+    [helperPlistFilename]: helperPlist,
+  }
+  if (helperEHPlist != null) {
+    plistDataToWrite[helperEHPlistFilename] = helperEHPlist
+  }
+  if (helperNPPlist != null) {
+    plistDataToWrite[helperNPPlistFilename] = helperNPPlist
+  }
+  if (helperRendererPlist != null) {
+    plistDataToWrite[helperRendererPlistFilename] = helperRendererPlist
+  }
+  if (helperPluginPlist != null) {
+    plistDataToWrite[helperPluginPlistFilename] = helperPluginPlist
+  }
+  if (helperGPUPlist != null) {
+    plistDataToWrite[helperGPUPlistFilename] = helperGPUPlist
+  }
+  if (helperLoginPlist != null) {
+    plistDataToWrite[helperLoginPlistFilename] = helperLoginPlist
+  }
+
   await Promise.all([
-    writeFile(appPlistFilename, buildPlist(appPlist)),
-    writeFile(helperPlistFilename, buildPlist(helperPlist)),
-    helperEHPlist == null ? Promise.resolve() : writeFile(helperEHPlistFilename, buildPlist(helperEHPlist)),
-    helperNPPlist == null ? Promise.resolve() : writeFile(helperNPPlistFilename, buildPlist(helperNPPlist)),
-    helperLoginPlist == null ? Promise.resolve() : writeFile(helperLoginPlistFilename, buildPlist(helperLoginPlist)),
-    doRename(path.join(contentsPath, "MacOS"), packager.electronDistMacOsExecutableName, appPlist.CFBundleExecutable),
+    executeAppBuilderAndWriteJson(["encode-plist"], plistDataToWrite),
+    doRename(path.join(contentsPath, "MacOS"), "Electron", appPlist.CFBundleExecutable),
     unlinkIfExists(path.join(appOutDir, "LICENSE")),
     unlinkIfExists(path.join(appOutDir, "LICENSES.chromium.html")),
   ])
 
-  await moveHelpers(getAvailableHelperSuffixes(helperEHPlist, helperNPPlist), frameworksPath, appFilename, packager.electronDistMacOsExecutableName)
+  await moveHelpers(getAvailableHelperSuffixes(helperEHPlist, helperNPPlist, helperRendererPlist, helperPluginPlist, helperGPUPlist), frameworksPath, appFilename, "Electron")
 
   if (helperLoginPlist != null) {
-    const prefix = packager.electronDistMacOsExecutableName
+    const prefix = "Electron"
     const suffix = " Login Helper"
     const executableBasePath = path.join(loginItemPath, `${prefix}${suffix}.app`, "Contents", "MacOS")
     await doRename(executableBasePath, `${prefix}${suffix}`, appFilename + suffix)
@@ -172,4 +238,35 @@ export async function createMacApp(packager: MacPackager, appOutDir: string, asa
   // https://github.com/electron-userland/electron-builder/issues/840
   const now = Date.now() / 1000
   await utimes(appPath, now, now)
+}
+
+function configureLocalhostAts(appPlist: any) {
+  // https://bencoding.com/2015/07/20/app-transport-security-and-localhost/
+  let ats = appPlist.NSAppTransportSecurity
+  if (ats == null) {
+    ats = {}
+    appPlist.NSAppTransportSecurity = ats
+  }
+
+  ats.NSAllowsLocalNetworking = true
+  // https://github.com/electron-userland/electron-builder/issues/3377#issuecomment-446035814
+  ats.NSAllowsArbitraryLoads = true
+
+  let exceptionDomains = ats.NSExceptionDomains
+  if (exceptionDomains == null) {
+    exceptionDomains = {}
+    ats.NSExceptionDomains = exceptionDomains
+  }
+
+  if (exceptionDomains.localhost == null) {
+    const allowHttp = {
+      NSTemporaryExceptionAllowsInsecureHTTPSLoads: false,
+      NSIncludesSubdomains: false,
+      NSTemporaryExceptionAllowsInsecureHTTPLoads: true,
+      NSTemporaryExceptionMinimumTLSVersion: "1.0",
+      NSTemporaryExceptionRequiresForwardSecrecy: false
+    }
+    exceptionDomains.localhost = allowHttp
+    exceptionDomains["127.0.0.1"] = allowHttp
+  }
 }

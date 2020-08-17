@@ -1,20 +1,22 @@
 import { AllPublishOptions, asArray, CancellationToken, newError, PublishConfiguration, UpdateInfo, UUID, DownloadOptions, CancellationError } from "builder-util-runtime"
 import { randomBytes } from "crypto"
 import { Notification } from "electron"
-import isDev from "electron-is-dev"
 import { EventEmitter } from "events"
-import { ensureDir, outputFile, readFile, rename, unlink } from "fs-extra-p"
+import { ensureDir, outputFile, readFile, rename, unlink } from "fs-extra"
 import { OutgoingHttpHeaders } from "http"
 import { safeLoad } from "js-yaml"
 import { Lazy } from "lazy-val"
 import * as path from "path"
-import { eq as isVersionsEqual, gt as isVersionGreaterThan, parse as parseVersion, prerelease as getVersionPreleaseComponents, SemVer } from "semver"
-import "source-map-support/register"
-import { DownloadedUpdateHelper } from "./DownloadedUpdateHelper"
-import { ElectronHttpExecutor } from "./electronHttpExecutor"
+import { eq as isVersionsEqual, gt as isVersionGreaterThan, lt as isVersionLessThan, parse as parseVersion, prerelease as getVersionPreleaseComponents, SemVer } from "semver"
+import { AppAdapter } from "./AppAdapter"
+import { createTempUpdateFile, DownloadedUpdateHelper } from "./DownloadedUpdateHelper"
+import { ElectronAppAdapter } from "./ElectronAppAdapter"
+import { ElectronHttpExecutor, getNetSession } from "./electronHttpExecutor"
 import { GenericProvider } from "./providers/GenericProvider"
-import { DOWNLOAD_PROGRESS, Logger, Provider, ResolvedUpdateFileInfo, UpdateCheckResult, UpdaterSignal } from "./main"
+import { DOWNLOAD_PROGRESS, Logger, Provider, ResolvedUpdateFileInfo, UPDATE_DOWNLOADED, UpdateCheckResult, UpdateDownloadedEvent, UpdaterSignal } from "./main"
 import { createClient, isUrlProbablySupportMultiRangeRequests } from "./providerFactory"
+import { ProviderPlatform } from "./providers/Provider"
+import Session = Electron.Session
 
 export abstract class AppUpdater extends EventEmitter {
   /**
@@ -58,7 +60,7 @@ export abstract class AppUpdater extends EventEmitter {
 
   private _channel: string | null = null
 
-  protected readonly downloadedUpdateHelper: DownloadedUpdateHelper
+  protected downloadedUpdateHelper: DownloadedUpdateHelper | null = null
 
   /**
    * Get the update channel. Not applicable for GitHub. Doesn't return `channel` from the update configuration, only if was previously set.
@@ -94,6 +96,11 @@ export abstract class AppUpdater extends EventEmitter {
 
   protected _logger: Logger = console
 
+  // noinspection JSMethodCanBeStatic,JSUnusedGlobalSymbols
+  get netSession(): Session {
+    return getNetSession()
+  }
+
   /**
    * The logger. You can pass [electron-log](https://github.com/megahertz/electron-log), [winston](https://github.com/winstonjs/winston) or another logger with the following interface: `{ info(), warn(), error() }`.
    * Set it to `null` if you would like to disable a logging feature.
@@ -127,64 +134,51 @@ export abstract class AppUpdater extends EventEmitter {
 
   private clientPromise: Promise<Provider<any>> | null = null
 
-  protected get provider(): Promise<Provider<any>> {
-    return this.clientPromise!!
-  }
-
   protected readonly stagingUserIdPromise = new Lazy<string>(() => this.getOrCreateStagingUserId())
 
   // public, allow to read old config for anyone
   /** @internal */
   configOnDisk = new Lazy<any>(() => this.loadUpdateConfig())
 
-  private readonly untilAppReady: Promise<any>
   private checkForUpdatesPromise: Promise<UpdateCheckResult> | null = null
 
-  protected readonly app: Electron.App
+  protected readonly app: AppAdapter
 
-  protected updateInfo: UpdateInfo | null = null
+  protected updateInfoAndProvider: UpdateInfoAndProvider | null = null
 
   /** @internal */
   readonly httpExecutor: ElectronHttpExecutor
 
-  protected constructor(options: AllPublishOptions | null | undefined, app?: Electron.App) {
+  protected constructor(options: AllPublishOptions | null | undefined, app?: AppAdapter) {
     super()
 
     this.on("error", (error: Error) => {
       this._logger.error(`Error: ${error.stack || error.message}`)
     })
 
-    if (app != null || (global as any).__test_app != null) {
-      this.app = app || (global as any).__test_app
-      this.untilAppReady = Promise.resolve()
-      this.httpExecutor = null as any
+    if (app == null) {
+      this.app = new ElectronAppAdapter()
+      this.httpExecutor = new ElectronHttpExecutor((authInfo, callback) => this.emit("login", authInfo, callback))
     }
     else {
-      this.app = require("electron").app
-      this.httpExecutor = new ElectronHttpExecutor((authInfo, callback) => this.emit("login", authInfo, callback))
-      this.untilAppReady = new Promise(resolve => {
-        if (this.app.isReady()) {
-          resolve()
-        }
-        else {
-          this.app.on("ready", resolve)
-        }
-      })
+      this.app = app
+      this.httpExecutor = null as any
     }
 
-    this.downloadedUpdateHelper = new DownloadedUpdateHelper(path.join(this.app.getPath("userData"), "__update__"))
-
-    const currentVersionString = this.app.getVersion()
+    const currentVersionString = this.app.version
     const currentVersion = parseVersion(currentVersionString)
     if (currentVersion == null) {
       throw newError(`App version is not a valid semver version: "${currentVersionString}"`, "ERR_UPDATER_INVALID_VERSION")
     }
     this.currentVersion = currentVersion
-
     this.allowPrerelease = hasPrereleaseComponents(currentVersion)
 
     if (options != null) {
       this.setFeedURL(options)
+
+      if (typeof options !== "string" && options.requestHeaders) {
+        this.requestHeaders = options.requestHeaders
+      }
     }
   }
 
@@ -198,13 +192,17 @@ export abstract class AppUpdater extends EventEmitter {
    * @param options If you want to override configuration in the `app-update.yml`.
    */
   setFeedURL(options: PublishConfiguration | AllPublishOptions | string) {
+    const runtimeOptions = this.createProviderRuntimeOptions()
     // https://github.com/electron-userland/electron-builder/issues/1105
     let provider: Provider<any>
     if (typeof options === "string") {
-      provider = new GenericProvider({provider: "generic", url: options}, this, isUrlProbablySupportMultiRangeRequests(options))
+      provider = new GenericProvider({provider: "generic", url: options}, this, {
+        ...runtimeOptions,
+        isUseMultipleRangeRequest: isUrlProbablySupportMultiRangeRequests(options),
+      })
     }
     else {
-      provider = createClient(options, this)
+      provider = createClient(options, this, runtimeOptions)
     }
     this.clientPromise = Promise.resolve(provider)
   }
@@ -215,25 +213,43 @@ export abstract class AppUpdater extends EventEmitter {
   checkForUpdates(): Promise<UpdateCheckResult> {
     let checkForUpdatesPromise = this.checkForUpdatesPromise
     if (checkForUpdatesPromise != null) {
+      this._logger.info("Checking for update (already in progress)")
       return checkForUpdatesPromise
     }
 
-    checkForUpdatesPromise = this._checkForUpdates()
-    this.checkForUpdatesPromise = checkForUpdatesPromise
     const nullizePromise = () => this.checkForUpdatesPromise = null
-    checkForUpdatesPromise
-      .then(nullizePromise)
-      .catch(nullizePromise)
+
+    this._logger.info("Checking for update")
+    checkForUpdatesPromise = this.doCheckForUpdates()
+      .then(it => {
+        nullizePromise()
+        return it
+      })
+      .catch(e => {
+        nullizePromise()
+        this.emit("error", e, `Cannot check for updates: ${(e.stack || e).toString()}`)
+        throw e
+      })
+
+    this.checkForUpdatesPromise = checkForUpdatesPromise
     return checkForUpdatesPromise
   }
 
-  checkForUpdatesAndNotify(): Promise<UpdateCheckResult | null> {
-    if (isDev) {
+  public isUpdaterActive(): boolean {
+    if (!this.app.isPackaged) {
+      this._logger.info("Skip checkForUpdatesAndNotify because application is not packed")
+      return false
+    }
+    return true
+  }
+
+  // noinspection JSUnusedGlobalSymbols
+  checkForUpdatesAndNotify(downloadNotification?: DownloadNotification): Promise<UpdateCheckResult | null> {
+    if (!this.isUpdaterActive()) {
       return Promise.resolve(null)
     }
 
-    const checkForUpdatesPromise = this.checkForUpdates()
-    checkForUpdatesPromise
+    return this.checkForUpdates()
       .then(it => {
         const downloadPromise = it.downloadPromise
         if (downloadPromise == null) {
@@ -241,19 +257,31 @@ export abstract class AppUpdater extends EventEmitter {
           if (debug != null) {
             debug("checkForUpdatesAndNotify called, downloadPromise is null")
           }
-          return
+          return it
         }
 
         downloadPromise
           .then(() => {
-            new Notification({
-              title: "A new update is ready to install",
-              body: `${this.app.getName()} version ${it.updateInfo.version} has been downloaded and will be automatically installed on exit`
-            }).show()
+            const notificationContent = this.formatDownloadNotification(it.updateInfo.version, this.app.name, downloadNotification);
+            new Notification(notificationContent).show()
           })
-      })
 
-    return checkForUpdatesPromise
+        return it
+      })
+  }
+
+  private formatDownloadNotification(version: string, appName: string, downloadNotification?: DownloadNotification): DownloadNotification {
+    if (downloadNotification == null) {
+      downloadNotification = {
+        title: "A new update is ready to install",
+        body: `{appName} version {version} has been downloaded and will be automatically installed on exit`
+      }
+    }
+    downloadNotification = {
+      title: downloadNotification.title.replace("{appName}", appName).replace("{version}", version),
+      body: downloadNotification.body.replace("{appName}", appName).replace("{version}", version)
+    }
+    return downloadNotification;
   }
 
   private async isStagingMatch(updateInfo: UpdateInfo): Promise<boolean> {
@@ -279,19 +307,6 @@ export abstract class AppUpdater extends EventEmitter {
     return percentage < stagingPercentage
   }
 
-  private async _checkForUpdates(): Promise<UpdateCheckResult> {
-    try {
-      await this.untilAppReady
-      this._logger.info("Checking for update")
-      this.emit("checking-for-update")
-      return await this.doCheckForUpdates()
-    }
-    catch (e) {
-      this.emit("error", e, `Cannot check for updates: ${(e.stack || e).toString()}`)
-      throw e
-    }
-  }
-
   private computeFinalHeaders(headers: OutgoingHttpHeaders) {
     if (this.requestHeaders != null) {
       Object.assign(headers, this.requestHeaders)
@@ -302,7 +317,7 @@ export abstract class AppUpdater extends EventEmitter {
   private async isUpdateAvailable(updateInfo: UpdateInfo): Promise<boolean> {
     const latestVersion = parseVersion(updateInfo.version)
     if (latestVersion == null) {
-      throw newError(`This file could not be downloaded, or the latest version (from update server) does not have a valid semver version: "${latestVersion}"`, "ERR_UPDATER_INVALID_VERSION")
+      throw newError(`This file could not be downloaded, or the latest version (from update server) does not have a valid semver version: "${updateInfo.version}"`, "ERR_UPDATER_INVALID_VERSION")
     }
 
     const currentVersion = this.currentVersion
@@ -318,35 +333,44 @@ export abstract class AppUpdater extends EventEmitter {
     // https://github.com/electron-userland/electron-builder/pull/3111#issuecomment-405033227
     // https://github.com/electron-userland/electron-builder/pull/3111#issuecomment-405030797
     const isLatestVersionNewer = isVersionGreaterThan(latestVersion, currentVersion)
-    if (!this.allowDowngrade) {
-      return isLatestVersionNewer
-    }
+    const isLatestVersionOlder = isVersionLessThan(latestVersion, currentVersion)
 
-    const currentVersionPrereleaseComponent = getVersionPreleaseComponents(currentVersion)
-    const latestVersionPrereleaseComponent = getVersionPreleaseComponents(latestVersion)
-    if (currentVersionPrereleaseComponent === latestVersionPrereleaseComponent) {
-      // allowDowngrade taken in account only if channel differs
-      return isLatestVersionNewer
+    if (isLatestVersionNewer) {
+      return true
     }
-
-    return true
+    return this.allowDowngrade && isLatestVersionOlder;
   }
 
-  protected async getUpdateInfo(): Promise<UpdateInfo> {
-    await this.untilAppReady
+  protected async getUpdateInfoAndProvider(): Promise<UpdateInfoAndProvider> {
+    await this.app.whenReady()
 
     if (this.clientPromise == null) {
-      this.clientPromise = this.configOnDisk.value.then(it => createClient(it, this))
+      this.clientPromise = this.configOnDisk.value.then(it => createClient(it, this, this.createProviderRuntimeOptions()))
     }
 
     const client = await this.clientPromise
     const stagingUserId = await this.stagingUserIdPromise.value
     client.setRequestHeaders(this.computeFinalHeaders({"x-user-staging-id": stagingUserId}))
-    return await client.getLatestVersion()
+    return {
+      info: await client.getLatestVersion(),
+      provider: client,
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+  private createProviderRuntimeOptions() {
+    return {
+      isUseMultipleRangeRequest: true,
+      platform: this._testOnlyOptions == null ? process.platform as ProviderPlatform : this._testOnlyOptions.platform,
+      executor: this.httpExecutor,
+    }
   }
 
   private async doCheckForUpdates(): Promise<UpdateCheckResult> {
-    const updateInfo = await this.getUpdateInfo()
+    this.emit("checking-for-update")
+
+    const result = await this.getUpdateInfoAndProvider()
+    const updateInfo = result.info
     if (!await this.isUpdateAvailable(updateInfo)) {
       this._logger.info(`Update for version ${this.currentVersion} is not available (latest version: ${updateInfo.version}, downgrade is ${this.allowDowngrade ? "allowed" : "disallowed"}).`)
       this.emit("update-not-available", updateInfo)
@@ -356,8 +380,7 @@ export abstract class AppUpdater extends EventEmitter {
       }
     }
 
-    this.updateInfo = updateInfo
-
+    this.updateInfoAndProvider = result
     this.onUpdateAvailable(updateInfo)
 
     const cancellationToken = new CancellationToken()
@@ -370,7 +393,7 @@ export abstract class AppUpdater extends EventEmitter {
     }
   }
 
-  protected onUpdateAvailable(updateInfo: UpdateInfo) {
+  protected onUpdateAvailable(updateInfo: UpdateInfo): void {
     this._logger.info(`Found version ${updateInfo.version} (url: ${asArray(updateInfo.files).map(it => it.url).join(", ")})`)
     this.emit("update-available", updateInfo)
   }
@@ -379,31 +402,50 @@ export abstract class AppUpdater extends EventEmitter {
    * Start downloading update manually. You can use this method if `autoDownload` option is set to `false`.
    * @returns {Promise<string>} Path to downloaded file.
    */
-  async downloadUpdate(cancellationToken: CancellationToken = new CancellationToken()): Promise<any> {
-    const updateInfo = this.updateInfo
-    if (updateInfo == null) {
+  downloadUpdate(cancellationToken: CancellationToken = new CancellationToken()): Promise<any> {
+    const updateInfoAndProvider = this.updateInfoAndProvider
+    if (updateInfoAndProvider == null) {
       const error = new Error("Please check update first")
       this.dispatchError(error)
-      throw error
+      return Promise.reject(error)
     }
 
-    this._logger.info(`Downloading update from ${asArray(updateInfo.files).map(it => it.url).join(", ")}`)
+    this._logger.info(`Downloading update from ${asArray(updateInfoAndProvider.info.files).map(it => it.url).join(", ")}`)
+    const errorHandler = (e: Error): Error => {
+      // https://github.com/electron-userland/electron-builder/issues/1150#issuecomment-436891159
+      if (!(e instanceof CancellationError)) {
+        try {
+          this.dispatchError(e)
+        }
+        catch (nestedError) {
+          this._logger.warn(`Cannot dispatch error event: ${nestedError.stack || nestedError}`)
+        }
+      }
+
+      return e
+    }
 
     try {
-      return await this.doDownloadUpdate({
-        updateInfo,
-        requestHeaders: await this.computeRequestHeaders(),
+      return this.doDownloadUpdate({
+        updateInfoAndProvider,
+        requestHeaders: this.computeRequestHeaders(updateInfoAndProvider.provider),
         cancellationToken,
       })
+        .catch(e => {
+          throw errorHandler(e)
+        })
     }
     catch (e) {
-      this.dispatchError(e)
-      throw e
+      return Promise.reject(errorHandler(e))
     }
   }
 
-  protected dispatchError(e: Error) {
+  protected dispatchError(e: Error): void {
     this.emit("error", e, (e.stack || e).toString())
+  }
+
+  protected dispatchUpdateDownloaded(event: UpdateDownloadedEvent): void {
+    this.emit(UPDATE_DOWNLOADED, event)
   }
 
   protected async abstract doDownloadUpdate(downloadUpdateOptions: DownloadUpdateOptions): Promise<Array<string>>
@@ -420,15 +462,15 @@ export abstract class AppUpdater extends EventEmitter {
    */
   abstract quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void
 
-  private async loadUpdateConfig() {
+  private async loadUpdateConfig(): Promise<any> {
     if (this._appUpdateConfigPath == null) {
-      this._appUpdateConfigPath = isDev ? path.join(this.app.getAppPath(), "dev-app-update.yml") : path.join(process.resourcesPath!, "app-update.yml")
+      this._appUpdateConfigPath = this.app.appUpdateConfigPath
     }
     return safeLoad(await readFile(this._appUpdateConfigPath, "utf-8"))
   }
 
-  private async computeRequestHeaders(): Promise<OutgoingHttpHeaders> {
-    const fileExtraDownloadHeaders = (await this.provider).fileExtraDownloadHeaders
+  private computeRequestHeaders(provider: Provider<any>): OutgoingHttpHeaders {
+    const fileExtraDownloadHeaders = provider.fileExtraDownloadHeaders
     if (fileExtraDownloadHeaders != null) {
       const requestHeaders = this.requestHeaders
       return requestHeaders == null ? fileExtraDownloadHeaders : {
@@ -440,7 +482,7 @@ export abstract class AppUpdater extends EventEmitter {
   }
 
   private async getOrCreateStagingUserId(): Promise<string> {
-    const file = path.join(this.app.getPath("userData"), ".updaterId")
+    const file = path.join(this.app.userDataPath, ".updaterId")
     try {
       const id = await readFile(file, "utf-8")
       if (UUID.check(id)) {
@@ -484,10 +526,34 @@ export abstract class AppUpdater extends EventEmitter {
     return true
   }
 
+  /**
+   * @private
+   * @internal
+   */
+  _testOnlyOptions: TestOnlyUpdaterOptions | null = null
+
+  private async getOrCreateDownloadHelper(): Promise<DownloadedUpdateHelper> {
+    let result = this.downloadedUpdateHelper
+    if (result == null) {
+      const dirName = (await this.configOnDisk.value).updaterCacheDirName
+      const logger = this._logger
+      if (dirName == null) {
+        logger.error("updaterCacheDirName is not specified in app-update.yml Was app build using at least electron-builder 20.34.0?")
+      }
+      const cacheDir = path.join(this.app.baseCachePath, dirName || this.app.name)
+      if (logger.debug != null) {
+        logger.debug(`updater cache dir: ${cacheDir}`)
+      }
+
+      result = new DownloadedUpdateHelper(cacheDir)
+      this.downloadedUpdateHelper = result
+    }
+    return result
+  }
+
   protected async executeDownload(taskOptions: DownloadExecutorTask): Promise<Array<string>> {
     const fileInfo = taskOptions.fileInfo
     const downloadOptions: DownloadOptions = {
-      skipDirCreation: true,
       headers: taskOptions.downloadUpdateOptions.requestHeaders,
       cancellationToken: taskOptions.downloadUpdateOptions.cancellationToken,
       sha2: (fileInfo.info as any).sha2,
@@ -498,12 +564,12 @@ export abstract class AppUpdater extends EventEmitter {
       downloadOptions.onProgress = it => this.emit(DOWNLOAD_PROGRESS, it)
     }
 
-    const updateInfo = taskOptions.downloadUpdateOptions.updateInfo
+    const updateInfo = taskOptions.downloadUpdateOptions.updateInfoAndProvider.info
     const version = updateInfo.version
     const packageInfo = fileInfo.packageInfo
 
     function getCacheUpdateFileName(): string {
-      // bloody NodeJS URL doesn't decode automatically
+      // NodeJS URL doesn't decode automatically
       const urlPath = decodeURIComponent(taskOptions.fileInfo.url.pathname)
       if (urlPath.endsWith(`.${taskOptions.fileExtension}`)) {
         return path.posix.basename(urlPath)
@@ -514,31 +580,31 @@ export abstract class AppUpdater extends EventEmitter {
       }
     }
 
-    const cacheDir = this.downloadedUpdateHelper.cacheDir
+    const downloadedUpdateHelper = await this.getOrCreateDownloadHelper()
+    const cacheDir = downloadedUpdateHelper.cacheDirForPendingUpdate
     await ensureDir(cacheDir)
     const updateFileName = getCacheUpdateFileName()
     let updateFile = path.join(cacheDir, updateFileName)
     const packageFile = packageInfo == null ? null : path.join(cacheDir, `package-${version}${path.extname(packageInfo.path) || ".7z"}`)
 
     const done = async (isSaveCache: boolean) => {
-      this.downloadedUpdateHelper.setDownloadedFile(updateFile, packageFile, updateInfo, fileInfo)
-      if (isSaveCache) {
-        await this.downloadedUpdateHelper.cacheUpdateInfo(updateFileName)
-      }
-
-      await taskOptions.done!!(updateFile)
+      await downloadedUpdateHelper.setDownloadedFile(updateFile, packageFile, updateInfo, fileInfo, updateFileName, isSaveCache)
+      await taskOptions.done!!({
+        ...updateInfo,
+        downloadedFile: updateFile,
+      })
       return packageFile == null ? [updateFile] : [updateFile, packageFile]
     }
 
     const log = this._logger
-    const cachedUpdateFile = await this.downloadedUpdateHelper.validateDownloadedPath(updateFile, updateInfo, fileInfo, log)
+    const cachedUpdateFile = await downloadedUpdateHelper.validateDownloadedPath(updateFile, updateInfo, fileInfo, log)
     if (cachedUpdateFile != null) {
       updateFile = cachedUpdateFile
       return await done(false)
     }
 
     const removeFileIfAny = async () => {
-      await this.downloadedUpdateHelper.clear()
+      await downloadedUpdateHelper.clear()
         .catch(() => {
           // ignore
         })
@@ -548,23 +614,7 @@ export abstract class AppUpdater extends EventEmitter {
         })
     }
 
-    // https://github.com/electron-userland/electron-builder/pull/2474#issuecomment-366481912
-    let nameCounter = 0
-    let tempUpdateFile = path.join(cacheDir, `temp-${updateFileName}`)
-    for (let i = 0; i < 3; i++) {
-      try {
-        await unlink(tempUpdateFile)
-      }
-      catch (e) {
-        if (e.code === "ENOENT") {
-          break
-        }
-
-        log.warn(`Error on remove temp update file: ${e}`)
-        tempUpdateFile = path.join(cacheDir, `temp-${nameCounter++}-${updateFileName}`)
-      }
-    }
-
+    const tempUpdateFile = await createTempUpdateFile(`temp-${updateFileName}`, cacheDir, log)
     try {
       await taskOptions.task(tempUpdateFile, downloadOptions, packageFile, removeFileIfAny)
       await rename(tempUpdateFile, updateFile)
@@ -573,7 +623,7 @@ export abstract class AppUpdater extends EventEmitter {
       await removeFileIfAny()
 
       if (e instanceof CancellationError) {
-        log.info("Cancelled")
+        log.info("cancelled")
         this.emit("update-cancelled", updateInfo)
       }
       throw e
@@ -585,7 +635,7 @@ export abstract class AppUpdater extends EventEmitter {
 }
 
 export interface DownloadUpdateOptions {
-  readonly updateInfo: UpdateInfo
+  readonly updateInfoAndProvider: UpdateInfoAndProvider
   readonly requestHeaders: OutgoingHttpHeaders
   readonly cancellationToken: CancellationToken
 }
@@ -597,17 +647,25 @@ function hasPrereleaseComponents(version: SemVer) {
 
 /** @private */
 export class NoOpLogger implements Logger {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   info(message?: any) {
     // ignore
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   warn(message?: any) {
     // ignore
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   error(message?: any) {
     // ignore
   }
+}
+
+export interface UpdateInfoAndProvider {
+  info: UpdateInfo
+  provider: Provider<any>
 }
 
 export interface DownloadExecutorTask {
@@ -616,5 +674,17 @@ export interface DownloadExecutorTask {
   readonly downloadUpdateOptions: DownloadUpdateOptions
   readonly task: (destinationFile: string, downloadOptions: DownloadOptions, packageFile: string | null, removeTempDirIfAny: () => Promise<any>) => Promise<any>
 
-  readonly done?: (destinationFile: string) => Promise<any>
+  readonly done?: (event: UpdateDownloadedEvent) => Promise<any>
+}
+
+export interface DownloadNotification {
+  body: string
+  title: string
+}
+
+/** @private */
+export interface TestOnlyUpdaterOptions {
+  platform: ProviderPlatform
+
+  isUseDifferentialDownload?: boolean
 }

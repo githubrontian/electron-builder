@@ -1,8 +1,9 @@
-import { log, executeAppBuilderAsJson } from "builder-util"
+import { log } from "builder-util"
 import { BlockMapDataHolder, PackageFileInfo } from "builder-util-runtime"
 import * as path from "path"
 import { Target } from "../core"
 import { PlatformPackager } from "../platformPackager"
+import { executeAppBuilderAsJson } from "../util/appBuilder"
 import { ArchiveOptions } from "./archive"
 
 export const BLOCK_MAP_FILE_SUFFIX = ".blockmap"
@@ -70,7 +71,7 @@ export async function createBlockmap(file: string, target: Target, packager: Pla
   const blockMapFile = `${file}${BLOCK_MAP_FILE_SUFFIX}`
   log.info({blockMapFile: log.filePath(blockMapFile)}, "building block map")
   const updateInfo = await executeAppBuilderAsJson<BlockMapDataHolder>(["blockmap", "--input", file, "--output", blockMapFile])
-  packager.info.dispatchArtifactCreated({
+  await packager.info.callArtifactBuildCompleted({
     file: blockMapFile,
     safeArtifactName: safeArtifactName == null ? null : `${safeArtifactName}${BLOCK_MAP_FILE_SUFFIX}`,
     target,

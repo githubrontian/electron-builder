@@ -1,8 +1,9 @@
 import BluebirdPromise from "bluebird-lst"
-import { Arch, asArray, AsyncTaskManager, debug, DebugLogger, deepAssign, executeAppBuilderAsJson, getArchSuffix, InvalidConfigurationError, isEmptyOrSpaces, log } from "builder-util"
+import { Arch, asArray, AsyncTaskManager, debug, DebugLogger, deepAssign, getArchSuffix, InvalidConfigurationError, isEmptyOrSpaces, log, isEnvTrue } from "builder-util"
+import { getArtifactArchName } from "builder-util/out/arch"
 import { FileTransformer, statOrNull } from "builder-util/out/fs"
 import { orIfFileNotExist } from "builder-util/out/promise"
-import { readdir } from "fs-extra-p"
+import { readdir } from "fs-extra"
 import { Lazy } from "lazy-val"
 import { Minimatch } from "minimatch"
 import * as path from "path"
@@ -12,9 +13,10 @@ import { AsarPackager } from "./asar/asarUtil"
 import { computeData } from "./asar/integrity"
 import { copyFiles, FileMatcher, getFileMatchers, GetFileMatchersOptions, getMainFileMatchers, getNodeModuleFileMatcher } from "./fileMatcher"
 import { createTransformer, isElectronCompileUsed } from "./fileTransformer"
-import { isElectronBased } from "./Framework"
-import { PackagerOptions, Packager, AfterPackContext, AsarOptions, Configuration, ElectronPlatformName, FileAssociation, PlatformSpecificBuildOptions, CompressionLevel, Platform, Target, TargetSpecificOptions } from "./index"
-import { copyAppFiles, transformFiles, computeFileSets, computeNodeModuleFileSets, ELECTRON_COMPILE_SHIM_FILENAME } from "./util/appFileCopier"
+import { Framework, isElectronBased } from "./Framework"
+import { AfterPackContext, AsarOptions, CompressionLevel, Configuration, ElectronPlatformName, FileAssociation, Packager, PackagerOptions, Platform, PlatformSpecificBuildOptions, Target, TargetSpecificOptions } from "./index"
+import { executeAppBuilderAsJson } from "./util/appBuilder"
+import { computeFileSets, computeNodeModuleFileSets, copyAppFiles, ELECTRON_COMPILE_SHIM_FILENAME, transformFiles } from "./util/appFileCopier"
 import { expandMacro as doExpandMacro } from "./util/macroExpander"
 
 export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> {
@@ -64,6 +66,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
   abstract get defaultTarget(): Array<string>
 
+  // eslint-disable-next-line
   protected prepareAppInfo(appInfo: AppInfo) {
     return new AppInfo(this.info, null, this.platformSpecificBuildOptions)
   }
@@ -100,8 +103,8 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     return this.packagerOptions.prepackaged || path.join(outDir, `${this.platform.buildConfigurationKey}${getArchSuffix(arch)}${this.platform === Platform.MAC ? "" : "-unpacked"}`)
   }
 
-  dispatchArtifactCreated(file: string, target: Target | null, arch: Arch | null, safeArtifactName?: string | null) {
-    this.info.dispatchArtifactCreated({
+  dispatchArtifactCreated(file: string, target: Target | null, arch: Arch | null, safeArtifactName?: string | null): Promise<void> {
+    return this.info.callArtifactBuildCompleted({
       file, safeArtifactName, target, arch,
       packager: this,
     })
@@ -144,14 +147,6 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   private getExtraFileMatchers(isResources: boolean, appOutDir: string, options: GetFileMatchersOptions): Array<FileMatcher> | null {
     const base = isResources ? this.getResourcesDir(appOutDir) : (this.platform === Platform.MAC ? path.join(appOutDir, `${this.appInfo.productFilename}.app`, "Contents") : appOutDir)
     return getFileMatchers(this.config, isResources ? "extraResources" : "extraFiles", base, options)
-  }
-
-  get electronDistExecutableName() {
-    return this.config.muonVersion == null ? "electron" : "brave"
-  }
-
-  get electronDistMacOsExecutableName() {
-    return this.config.muonVersion == null ? "Electron" : "Brave"
   }
 
   createGetFileMatchersOptions(outDir: string, arch: Arch, customBuildOptions: PlatformSpecificBuildOptions): GetFileMatchersOptions {
@@ -217,9 +212,17 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       return
     }
 
-    const beforeCopyExtraFiles = this.info.framework.beforeCopyExtraFiles
-    if (beforeCopyExtraFiles != null) {
-      await beforeCopyExtraFiles(this, appOutDir, asarOptions == null ? null : await computeData(resourcesPath, asarOptions.externalAllowed ? {externalAllowed: true} : null))
+    if (framework.beforeCopyExtraFiles != null) {
+      await framework.beforeCopyExtraFiles({
+        packager: this,
+        appOutDir,
+        asarIntegrity: asarOptions == null ? null : await computeData(resourcesPath, asarOptions.externalAllowed ? {externalAllowed: true} : null),
+        platformName,
+      })
+    }
+
+    if (this.info.cancellationToken.cancelled) {
+      return
     }
 
     const transformerForExtraFiles = this.createTransformerForExtraFiles(packContext)
@@ -231,8 +234,13 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
 
     await this.info.afterPack(packContext)
+
+    if (framework.afterPack != null) {
+      await framework.afterPack(packContext)
+    }
+
     const isAsar = asarOptions != null
-    await this.sanityCheckPackage(appOutDir, isAsar)
+    await this.sanityCheckPackage(appOutDir, isAsar, framework)
     await this.signApp(packContext, isAsar)
 
     const afterSign = resolveFunction(this.config.afterSign, "afterSign")
@@ -241,6 +249,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
+  // eslint-disable-next-line
   protected createTransformerForExtraFiles(packContext: AfterPackContext): FileTransformer | null {
     return null
   }
@@ -315,6 +324,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected signApp(packContext: AfterPackContext, isAsar: boolean): Promise<any> {
     return Promise.resolve()
   }
@@ -348,7 +358,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       if (appAsarStat == null || !appAsarStat.isFile()) {
         log.warn({
           solution: "enable asar and use asarUnpack to unpack files that must be externally available",
-        }, "asar using is disabled — it is strongly not recommended")
+        }, "asar usage is disabled — this is strongly not recommended")
       }
       return null
     }
@@ -409,26 +419,27 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
         partWithAsarIndex = index
         return pathPart.endsWith(".asar")
       })
-      const asarPath = path.join.apply(path, pathSplit.slice(0, partWithAsarIndex + 1))
+      const asarPath = path.join(...pathSplit.slice(0, partWithAsarIndex + 1))
       let mainPath = pathSplit.length > (partWithAsarIndex + 1) ? path.join.apply(pathSplit.slice(partWithAsarIndex + 1)) : ""
       mainPath += path.join(mainPath, pathParsed.base)
       await checkFileInArchive(path.join(resourcesDir, "app", asarPath), mainPath, messagePrefix)
     }
     else {
-      const outStat = await statOrNull(path.join(resourcesDir, "app", relativeFile))
+      const fullPath = path.join(resourcesDir, "app", relativeFile)
+      const outStat = await statOrNull(fullPath)
       if (outStat == null) {
-        throw new Error(`${messagePrefix} "${relativeFile}" does not exist. Seems like a wrong configuration.`)
+        throw new Error(`${messagePrefix} "${fullPath}" does not exist. Seems like a wrong configuration.`)
       }
       else {
         //noinspection ES6MissingAwait
         if (!outStat.isFile()) {
-          throw new Error(`${messagePrefix} "${relativeFile}" is not a file. Seems like a wrong configuration.`)
+          throw new Error(`${messagePrefix} "${fullPath}" is not a file. Seems like a wrong configuration.`)
         }
       }
     }
   }
 
-  private async sanityCheckPackage(appOutDir: string, isAsar: boolean): Promise<any> {
+  private async sanityCheckPackage(appOutDir: string, isAsar: boolean, framework: Framework): Promise<any> {
     const outStat = await statOrNull(appOutDir)
     if (outStat == null) {
       throw new Error(`Output directory "${appOutDir}" does not exist. Seems like a wrong configuration.`)
@@ -441,48 +452,41 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
 
     const resourcesDir = this.getResourcesDir(appOutDir)
-    await this.checkFileInPackage(resourcesDir, this.info.metadata.main || "index.js", "Application entry file", isAsar)
+    const mainFile = (framework.getMainFile == null ? null : framework.getMainFile(this.platform)) || this.info.metadata.main || "index.js"
+    await this.checkFileInPackage(resourcesDir, mainFile, "Application entry file", isAsar)
     await this.checkFileInPackage(resourcesDir, "package.json", "Application", isAsar)
   }
 
   // tslint:disable-next-line:no-invalid-template-strings
   computeSafeArtifactName(suggestedName: string | null, ext: string, arch?: Arch | null, skipArchIfX64 = true, safePattern: string = "${name}-${version}-${arch}.${ext}"): string | null {
-    // GitHub only allows the listed characters in file names.
-    if (suggestedName != null && isSafeGithubName(suggestedName)) {
-      return null
-    }
-
-    return this.computeArtifactName(safePattern, ext, skipArchIfX64 && arch === Arch.x64 ? null : arch)
+    return computeSafeArtifactNameIfNeeded(suggestedName, () => this.computeArtifactName(safePattern, ext, skipArchIfX64 && arch === Arch.x64 ? null : arch))
   }
 
   expandArtifactNamePattern(targetSpecificOptions: TargetSpecificOptions | null | undefined, ext: string, arch?: Arch | null, defaultPattern?: string, skipArchIfX64 = true): string {
     let pattern = targetSpecificOptions == null ? null : targetSpecificOptions.artifactName
     if (pattern == null) {
+      pattern = this.platformSpecificBuildOptions.artifactName || this.config.artifactName
+    }
+
+    if (pattern == null) {
       // tslint:disable-next-line:no-invalid-template-strings
-      pattern = this.platformSpecificBuildOptions.artifactName || this.config.artifactName || defaultPattern || "${productName}-${version}-${arch}.${ext}"
+      pattern = defaultPattern || "${productName}-${version}-${arch}.${ext}"
+    }
+    else {
+      // https://github.com/electron-userland/electron-builder/issues/3510
+      // always respect arch in user custom artifact pattern
+      skipArchIfX64 = false
     }
     return this.computeArtifactName(pattern, ext, skipArchIfX64 && arch === Arch.x64 ? null : arch)
   }
 
-  private computeArtifactName(pattern: any, ext: string, arch: Arch | null | undefined) {
-    let archName: string | null = arch == null ? null : Arch[arch]
-    if (arch === Arch.x64) {
-      if (ext === "AppImage" || ext === "rpm") {
-        archName = "x86_64"
-      }
-      else if (ext === "deb" || ext === "snap") {
-        archName = "amd64"
-      }
-    }
-    else if (arch === Arch.ia32) {
-      if (ext === "deb" || ext === "AppImage" || ext === "snap") {
-        archName = "i386"
-      }
-      else if (ext === "pacman" || ext === "rpm") {
-        archName = "i686"
-      }
-    }
+  expandArtifactBeautyNamePattern(targetSpecificOptions: TargetSpecificOptions | null | undefined, ext: string, arch?: Arch | null): string {
+    // tslint:disable-next-line:no-invalid-template-strings
+    return this.expandArtifactNamePattern(targetSpecificOptions, ext, arch, "${productName} ${version} ${arch}.${ext}", true)
+  }
 
+  private computeArtifactName(pattern: any, ext: string, arch: Arch | null | undefined): string {
+    const archName = arch == null ? null : getArtifactArchName(arch, ext)
     return this.expandMacro(pattern, this.platform === Platform.MAC ? null : archName, {
       ext
     })
@@ -540,34 +544,28 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   }
 
   protected async getOrConvertIcon(format: IconFormat): Promise<string | null> {
-    const sourceNames = [`icon.${format === "set" ? "png" : format}`, "icon.png", "icons"]
-
-    const iconPath = this.platformSpecificBuildOptions.icon || this.config.icon
-    if (iconPath != null) {
-      sourceNames.unshift(iconPath)
-    }
-
-    if (format === "ico") {
-      sourceNames.push("icon.icns")
-    }
-
-    const result = await this.resolveIcon(sourceNames, format)
+    const result = await this.resolveIcon(asArray(this.platformSpecificBuildOptions.icon || this.config.icon), [], format)
     if (result.length === 0) {
       const framework = this.info.framework
       if (framework.getDefaultIcon != null) {
         return framework.getDefaultIcon(this.platform)
       }
 
-      log.warn({reason: "application icon is not set"}, framework.isDefaultAppIconProvided ? `default ${capitalizeFirstLetter(framework.name)} icon is used` : `application doesn't have an icon`)
-      return null
+      log.warn({reason: "application icon is not set"}, `default ${capitalizeFirstLetter(framework.name)} icon is used`)
+      return this.getDefaultFrameworkIcon()
     }
     else {
       return result[0].file
     }
   }
 
+  getDefaultFrameworkIcon(): string | null {
+    const framework = this.info.framework
+    return framework.getDefaultIcon == null ? null : framework.getDefaultIcon(this.platform)
+  }
+
   // convert if need, validate size (it is a reason why tool is called even if file has target extension (already specified as foo.icns for example))
-  async resolveIcon(sources: Array<string>, outputFormat: IconFormat): Promise<Array<IconInfo>> {
+  async resolveIcon(sources: Array<string>, fallbackSources: Array<string>, outputFormat: IconFormat): Promise<Array<IconInfo>> {
     const args = [
       "icon",
       "--format", outputFormat,
@@ -578,12 +576,20 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     for (const source of sources) {
       args.push("--input", source)
     }
+    for (const source of fallbackSources) {
+      args.push("--fallback-input", source)
+    }
 
     const result: IconConvertResult = await executeAppBuilderAsJson(args)
     const errorMessage = result.error
     if (errorMessage != null) {
       throw new InvalidConfigurationError(errorMessage, result.errorCode)
     }
+
+    if (result.isFallback) {
+      log.warn({reason: "application icon is not set"}, `default ${capitalizeFirstLetter(this.info.framework.name)} icon is used`)
+    }
+
     return result.icons || []
   }
 }
@@ -598,12 +604,30 @@ interface IconConvertResult {
 
   error?: string
   errorCode?: string
+  isFallback?: boolean
 }
 
 export type IconFormat = "icns" | "ico" | "set"
 
 export function isSafeGithubName(name: string) {
   return /^[0-9A-Za-z._-]+$/.test(name)
+}
+
+export function computeSafeArtifactNameIfNeeded(suggestedName: string | null, safeNameProducer: () => string): string | null {
+  // GitHub only allows the listed characters in file names.
+  if (suggestedName != null) {
+    if (isSafeGithubName(suggestedName)) {
+      return null
+    }
+
+    // prefer to use suggested name - so, if space is the only problem, just replace only space to dash
+    suggestedName = suggestedName.replace(/ /g, "-")
+    if (isSafeGithubName(suggestedName)) {
+      return suggestedName
+    }
+  }
+
+  return safeNameProducer()
 }
 
 // remove leading dot
@@ -629,6 +653,7 @@ export function resolveFunction<T>(executor: T | string, name: string): T {
     p = path.resolve(p)
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const m = require(p)
   const namedExport = m[name]
   if (namedExport == null) {
@@ -645,4 +670,15 @@ export function chooseNotNull(v1: string | null | undefined, v2: string | null |
 
 function capitalizeFirstLetter(text: string) {
   return text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+export function isSafeToUnpackElectronOnRemoteBuildServer(packager: PlatformPackager<any>) {
+  if (packager.platform !== Platform.LINUX || packager.config.remoteBuild === false) {
+    return false
+  }
+
+  if (process.platform === "win32" || isEnvTrue(process.env._REMOTE_BUILD)) {
+    return packager.config.electronDist == null && packager.config.electronDownload == null
+  }
+  return false
 }

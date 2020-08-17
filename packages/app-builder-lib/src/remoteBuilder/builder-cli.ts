@@ -1,6 +1,7 @@
-import { readJson, writeFile } from "fs-extra-p"
+import { readJson, writeFile } from "fs-extra"
 import * as path from "path"
 import { UploadTask, Arch, Packager, PackagerOptions, PublishOptions } from ".."
+import { InvalidConfigurationError } from "builder-util"
 import SnapTarget from "../targets/snap"
 
 if (process.env.BUILDER_REMOVE_STAGE_EVEN_IF_DEBUG == null) {
@@ -8,24 +9,24 @@ if (process.env.BUILDER_REMOVE_STAGE_EVEN_IF_DEBUG == null) {
 }
 
 async function doBuild(data: BuildTask): Promise<void> {
-  if (process.env.ELECTRON_BUILDER_TMP_DIR == null) {
-    throw new Error("Env ELECTRON_BUILDER_TMP_DIR must be set for builder process")
+  if (process.env.APP_BUILDER_TMP_DIR == null) {
+    throw new InvalidConfigurationError("Env APP_BUILDER_TMP_DIR must be set for builder process")
   }
 
   const projectDir = process.env.PROJECT_DIR
   if (projectDir == null) {
-    throw new Error("Env PROJECT_DIR must be set for builder process")
+    throw new InvalidConfigurationError("Env PROJECT_DIR must be set for builder process")
   }
 
   const targets = data.targets
   if (data.platform == null) {
-    throw new Error("platform not specified")
+    throw new InvalidConfigurationError("platform not specified")
   }
   if (targets == null) {
-    throw new Error("targets path not specified")
+    throw new InvalidConfigurationError("targets path not specified")
   }
   if (!Array.isArray(targets)) {
-    throw new Error("targets must be array of target name")
+    throw new InvalidConfigurationError("targets must be array of target name")
   }
 
   const infoFile = projectDir + path.sep + "info.json"
@@ -33,7 +34,7 @@ async function doBuild(data: BuildTask): Promise<void> {
 
   const projectOutDir = process.env.PROJECT_OUT_DIR
   if (projectDir == null) {
-    throw new Error("Env PROJECT_OUT_DIR must be set for builder process")
+    throw new InvalidConfigurationError("Env PROJECT_OUT_DIR must be set for builder process")
   }
 
   // yes, for now we expect the only target
@@ -86,13 +87,13 @@ async function doBuild(data: BuildTask): Promise<void> {
   }, info.metadata, info.devMetadata, info.repositoryInfo)
 
   // writeJson must be not used because it adds unwanted \n as last file symbol
-  await writeFile(path.join(process.env.ELECTRON_BUILDER_TMP_DIR!!, "__build-result.json"), JSON.stringify(artifacts))
+  await writeFile(path.join(process.env.APP_BUILDER_TMP_DIR!!, "__build-result.json"), JSON.stringify(artifacts))
 }
 
 doBuild(JSON.parse(process.argv[2]))
   .catch(error => {
     process.exitCode = 0
-    return writeFile(path.join(process.env.ELECTRON_BUILDER_TMP_DIR!!, "__build-result.json"), (error.stack || error).toString())
+    return writeFile(path.join(process.env.APP_BUILDER_TMP_DIR!!, "__build-result.json"), (error.stack || error).toString())
   })
 
 interface TargetInfo {

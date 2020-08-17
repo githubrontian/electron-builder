@@ -1,7 +1,7 @@
 import { AsyncTaskManager, log } from "builder-util"
 import { FileCopier, Filter, MAX_FILE_REQUESTS } from "builder-util/out/fs"
 import { symlink } from "fs"
-import { createReadStream, createWriteStream, ensureDir, readFile, Stats, writeFile } from "fs-extra-p"
+import { createReadStream, createWriteStream, ensureDir, readFile, Stats, writeFile } from "fs-extra"
 import * as path from "path"
 import { AsarOptions } from ".."
 import { Packager } from "../packager"
@@ -10,6 +10,7 @@ import { getDestinationPath, ResolvedFileSet } from "../util/appFileCopier"
 import { AsarFilesystem, Node } from "./asar"
 import { detectUnpackedDirs } from "./unpackDetector"
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const pickle = require("chromium-pickle-js")
 
 /** @internal */

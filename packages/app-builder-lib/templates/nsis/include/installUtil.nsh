@@ -1,3 +1,14 @@
+!macro moveFile FROM TO
+  ClearErrors
+  Rename `${FROM}` `${TO}`
+  ${if} ${errors}
+    # not clear - can NSIS rename on another drive or not, so, in case of error, just copy
+    ClearErrors
+    !insertmacro copyFile `${FROM}` `${TO}`
+    Delete `${FROM}`
+  ${endif}
+!macroend
+
 !macro copyFile FROM TO
   ${StdUtils.GetParentPath} $R5 `${TO}`
   CreateDirectory `$R5`
@@ -97,6 +108,7 @@ Var /GLOBAL isTryToKeepShortcuts
 # http://stackoverflow.com/questions/24595887/waiting-for-nsis-uninstaller-to-finish-in-nsis-installer-either-fails-or-the-uni
 Function uninstallOldVersion
   Var /GLOBAL uninstallerFileName
+  Var /Global uninstallerFileNameTemp
   Var /GLOBAL installationDir
   Var /GLOBAL uninstallString
   Var /GLOBAL rootKey
@@ -131,17 +143,6 @@ Function uninstallOldVersion
     Goto Done
   ${endif}
 
-  ClearErrors
-  Rename "$uninstallerFileName" "$PLUGINSDIR\old-uninstaller.exe"
-  ${if} ${errors}
-    # not clear - can NSIS rename on another drive or not, so, in case of error, just copy
-    ClearErrors
-    !insertmacro copyFile "$uninstallerFileName" "$PLUGINSDIR\old-uninstaller.exe"
-    Delete "$uninstallerFileName"
-  ${endif}
-
-  StrCpy $uninstallerFileName "$PLUGINSDIR\old-uninstaller.exe"
-
   ${if} $installMode == "CurrentUser"
   ${orIf} $rootKey == "HKEY_CURRENT_USER"
     StrCpy $0 "/currentuser"
@@ -167,8 +168,25 @@ Function uninstallOldVersion
     StrCpy $0 "$0 --updated"
   ${endif}
 
-  ExecWait '"$uninstallerFileName" /S /KEEP_APP_DATA $0 _?=$installationDir'
+  StrCpy $uninstallerFileNameTemp "$PLUGINSDIR\old-uninstaller.exe"
+  !insertmacro copyFile "$uninstallerFileName" "$uninstallerFileNameTemp"
 
+  ExecWait '"$uninstallerFileNameTemp" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
+  ifErrors 0 ExecErrorHandler
+    # the execution failed - might have been caused by some group policy restrictions
+    # we try to execute the uninstaller in place
+    ExecWait '"$uninstallerFileName" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
+    ifErrors 0 ExecErrorHandler
+      # this also failed...
+      DetailPrint `Aborting, uninstall was not successful. Not able to launch uninstaller!`
+      SetErrorLevel 5
+      Abort "Cannot uninstall"
+  ExecErrorHandler:
+  ${if} $R0 != 0
+    DetailPrint `Aborting, uninstall was not successful. Uninstaller error code: $R0.`
+    SetErrorLevel 5
+    Abort "Cannot uninstall"
+  ${endif}
   Done:
 FunctionEnd
 

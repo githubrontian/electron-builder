@@ -1,7 +1,8 @@
 import { exec } from "builder-util"
 import { parseXml } from "builder-util-runtime"
 import { Platform } from "electron-builder"
-import { outputFile, readFile, symlink } from "fs-extra-p"
+import { outputFile } from "fs-extra"
+import { promises as fs } from "fs"
 import * as path from "path"
 import pathSorter from "path-sort"
 import { assertThat } from "../helpers/fileAssert"
@@ -9,7 +10,7 @@ import { app, copyTestAsset, createMacTargetTest, getFixtureDir, parseFileList }
 
 test.ifMac.ifAll("invalid target", () => assertThat(createMacTargetTest(["ttt" as any])()).throws())
 
-test.ifNotWindows.ifAll("only zip", createMacTargetTest(["zip"]))
+test.ifNotWindows.ifAll("only zip", createMacTargetTest(["zip"], undefined, false /* no need to test sign */))
 
 test.ifNotWindows.ifAll("tar.gz", createMacTargetTest(["tar.gz"]))
 
@@ -21,7 +22,7 @@ test.ifAll.ifMac("empty installLocation", app({
   targets: Platform.MAC.createTarget("pkg"),
   config: {
     pkg: {
-      installLocation: ""
+      installLocation: "",
     }
   }
 }, {
@@ -67,25 +68,25 @@ test.ifAll.ifMac("pkg extended configuration", app({
     await exec("pkgutil", ["--expand", pkgPath, unpackedDir])
 
     const packageInfoFile = path.join(unpackedDir, "org.electron-builder.testApp.pkg", "PackageInfo")
-    const info = parseXml(await readFile(packageInfoFile, "utf8"))
+    const info = parseXml(await fs.readFile(packageInfoFile, "utf8"))
 
     const relocateElement = info.elementOrNull("relocate")
-    if (relocateElement) {
+    if (relocateElement != null) {
       expect(relocateElement.elements).toBeNull()
     }
 
     const upgradeBundleElement = info.elementOrNull("upgrade-bundle")
-    if (upgradeBundleElement) {
+    if (upgradeBundleElement != null) {
       expect(upgradeBundleElement.elements).toBeNull()
     }
 
     const updateBundleElement = info.elementOrNull("update-bundle")
-    if (updateBundleElement) {
+    if (updateBundleElement != null) {
       expect(updateBundleElement.elements).toHaveLength(1)
     }
 
     const strictIdentifierElement = info.elementOrNull("strict-identifier")
-    if (strictIdentifierElement) {
+    if (strictIdentifierElement != null) {
       expect(strictIdentifierElement.elements).toBeNull()
     }
   }
@@ -96,17 +97,18 @@ test.ifAll.ifMac("pkg scripts", app({
 }, {
   signed: false,
   projectDirCreated: async projectDir => {
-    await symlink(path.join(getFixtureDir(), "pkg-scripts"), path.join(projectDir, "build", "pkg-scripts"))
+    await fs.symlink(path.join(getFixtureDir(), "pkg-scripts"), path.join(projectDir, "build", "pkg-scripts"))
   },
   packed: async context => {
     const pkgPath = path.join(context.outDir, "Test App ßW-1.1.0.pkg")
+    console.log("CALL")
     const fileList = pathSorter(parseFileList(await exec("pkgutil", ["--payload-files", pkgPath]), false))
     expect(fileList).toMatchSnapshot()
 
     const unpackedDir = path.join(context.outDir, "pkg-unpacked")
     await exec("pkgutil", ["--expand", pkgPath, unpackedDir])
 
-    const info = parseXml(await readFile(path.join(unpackedDir, "Distribution"), "utf8"))
+    const info = parseXml(await fs.readFile(path.join(unpackedDir, "Distribution"), "utf8"))
     for (const element of info.getElements("pkg-ref")) {
       element.removeAttribute("installKBytes")
       const bundleVersion = element.elementOrNull("bundle-version")

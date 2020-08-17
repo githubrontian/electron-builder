@@ -43,6 +43,8 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
    */
   readonly entitlementsInherit?: string | null
 
+  readonly entitlementsLoginHelper?: string | null
+
   /**
    * The path to the provisioning profile to use when signing, absolute or relative to the app root.
    */
@@ -59,10 +61,46 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
   readonly bundleShortVersion?: string | null
 
   /**
+   * Whether a dark mode is supported. If your app does have a dark mode, you can make your app follow the system-wide dark mode setting.
+   * @default false
+   */
+  readonly darkModeSupport?: boolean
+
+  /**
    * The bundle identifier to use in the application helper's plist.
    * @default ${appBundleIdentifier}.helper
    */
   readonly helperBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the Renderer helper's plist.
+   * @default ${appBundleIdentifier}.helper.Renderer
+   */
+  readonly helperRendererBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the Plugin helper's plist.
+   * @default ${appBundleIdentifier}.helper.Plugin
+   */
+  readonly helperPluginBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the GPU helper's plist.
+   * @default ${appBundleIdentifier}.helper.GPU
+   */
+  readonly helperGPUBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the EH helper's plist.
+   * @default ${appBundleIdentifier}.helper.EH
+   */
+  readonly helperEHBundleId?: string | null
+
+  /**
+   * The bundle identifier to use in the NP helper's plist.
+   * @default ${appBundleIdentifier}.helper.NP
+   */
+  readonly helperNPBundleId?: string | null
 
   /**
    * Whether to sign app for development or for distribution.
@@ -104,107 +142,18 @@ export interface MacConfiguration extends PlatformSpecificBuildOptions {
    * Extra files to put in archive. Not applicable for `tar.*`.
    */
   readonly extraDistFiles?: Array<string> | string | null
-}
-
-/**
- * macOS product archive options.
- */
-export interface PkgOptions extends TargetSpecificOptions {
-  /**
-   * The scripts directory, relative to `build` (build resources directory).
-   * The scripts can be in any language so long as the files are marked executable and have the appropriate shebang indicating the path to the interpreter.
-   * Scripts are required to be executable (`chmod +x file`).
-   * @default build/pkg-scripts
-   * @see [Scripting in installer packages](http://macinstallers.blogspot.de/2012/07/scripting-in-installer-packages.html).
-   */
-  readonly scripts?: string | null
 
   /**
-   * should be not documented, only to experiment
-   * @private
-   */
-  readonly productbuild?: Array<string> | null
-
-  /**
-   * The install location. [Do not use it](https://stackoverflow.com/questions/12863944/how-do-you-specify-a-default-install-location-to-home-with-pkgbuild) to create per-user package.
-   * Mostly never you will need to change this option. `/Applications` would install it as expected into `/Applications` if the local system domain is chosen, or into `$HOME/Applications` if the home installation is chosen.
-   * @default /Applications
-   */
-  readonly installLocation?: string | null
-
-  /**
-   * Whether can be installed at the root of any volume, including non-system volumes. Otherwise, it cannot be installed at the root of a volume.
-   *
-   * Corresponds to [enable_anywhere](https://developer.apple.com/library/content/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html#//apple_ref/doc/uid/TP40005370-CH100-SW70).
+   * Whether your app has to be signed with hardened runtime.
    * @default true
    */
-  readonly allowAnywhere?: boolean | null
+  readonly hardenedRuntime?: boolean
 
   /**
-   * Whether can be installed into the current user’s home directory.
-   * A home directory installation is done as the current user (not as root), and it cannot write outside of the home directory.
-   * If the product cannot be installed in the user’s home directory and be not completely functional from user’s home directory.
-   *
-   * Corresponds to [enable_currentUserHome](https://developer.apple.com/library/content/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html#//apple_ref/doc/uid/TP40005370-CH100-SW70).
-   * @default true
+   * Whether to let electron-osx-sign validate the signing or not.
+   * @default false
    */
-  readonly allowCurrentUserHome?: boolean | null
-
-  /**
-   * Whether can be installed into the root directory. Should usually be `true` unless the product can be installed only to the user’s home directory.
-   *
-   * Corresponds to [enable_localSystem](https://developer.apple.com/library/content/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html#//apple_ref/doc/uid/TP40005370-CH100-SW70).
-   * @default true
-   */
-  readonly allowRootDirectory?: boolean | null
-
-  /**
-   * The name of certificate to use when signing. Consider using environment variables [CSC_LINK or CSC_NAME](/code-signing) instead of specifying this option.
-   */
-  readonly identity?: string | null
-
-  /**
-   * The path to EULA license file. Defaults to `license.txt` or `eula.txt` (or uppercase variants). In addition to `txt, `rtf` and `html` supported (don't forget to use `target="_blank"` for links).
-   */
-  readonly license?: string | null
-
-  /**
-   * Install bundle over previous version if moved by user?
-   * @default true
-   */
-  readonly isRelocatable?: boolean | null
-
-  /**
-   * Don't install bundle if newer version on disk?
-   * @default true
-   */
-  readonly isVersionChecked?: boolean | null
-
-  /**
-   * Require identical bundle identifiers at install path?
-   * @default true
-   */
-  readonly hasStrictIdentifier?: boolean | null
-
-  /**
-   * Specifies how an existing version of the bundle on disk should be handled when the version in
-   * the package is installed.
-   *
-   * If you specify upgrade, the bundle in the package atomi-cally replaces any version on disk;
-   * this has the effect of deleting old paths that no longer exist in the new version of
-   * the bundle.
-   *
-   * If you specify update, the bundle in the package overwrites the version on disk, and any files
-   * not contained in the package will be left intact; this is appropriate when you are delivering
-   * an update-only package.
-   *
-   * Another effect of update is that the package bundle will not be installed at all if there is
-   * not already a version on disk; this allows a package to deliver an update for an app that
-   * the user might have deleted.
-   *
-   * @default upgrade
-   */
-  readonly overwriteAction?: "upgrade" | "update" | null
+  readonly gatekeeperAssess?: boolean
 }
 
 export interface DmgOptions extends TargetSpecificOptions {
@@ -224,7 +173,7 @@ export interface DmgOptions extends TargetSpecificOptions {
    * The path to DMG icon (volume icon), which will be shown when mounted, relative to the [build resources](/configuration/configuration#MetadataDirectories-buildResources) or to the project directory.
    * Defaults to the application icon (`build/icon.icns`).
    */
-  readonly icon?: string | null
+  icon?: string | null
 
   /**
    * The size of all the icons inside the DMG.
@@ -247,7 +196,7 @@ export interface DmgOptions extends TargetSpecificOptions {
   readonly title?: string | null
 
   /**
-   * The content — to customize icon locations.
+   * The content — to customize icon locations. The x and y coordinates refer to the position of the **center** of the icon (at 1x scale), and do not take the label into account.
    */
   contents?: Array<DmgContent>
 
@@ -255,10 +204,13 @@ export interface DmgOptions extends TargetSpecificOptions {
    * The disk image format. `ULFO` (lzfse-compressed image (OS X 10.11+ only)).
    * @default UDZO
    */
-  readonly format?: "UDRW" | "UDRO" | "UDCO" | "UDZO" | "UDBZ" | "ULFO"
+  format?: "UDRW" | "UDRO" | "UDCO" | "UDZO" | "UDBZ" | "ULFO"
 
   /**
-   * The DMG windows position and size.
+   * The DMG window position and size. With y co-ordinates running from bottom to top.
+   *
+   * The Finder makes sure that the window will be on the user’s display, so if you want your window at the top left of the display you could use `"x": 0, "y": 100000` as the x, y co-ordinates.
+   * It is not to be possible to position the window relative to the [top left](https://github.com/electron-userland/electron-builder/issues/3990#issuecomment-512960957) or relative to the center of the user’s screen.
    */
   window?: DmgWindow
 
@@ -267,6 +219,18 @@ export interface DmgOptions extends TargetSpecificOptions {
    * @default false
    */
   readonly internetEnabled?: boolean
+
+  /**
+   * Whether to sign the DMG or not. Signing is not required and will lead to unwanted errors in combination with notarization requirements.
+   * @default false
+   */
+  readonly sign?: boolean
+
+  /**
+   * @private
+   * @default true
+   */
+  writeUpdateInfo?: boolean
 }
 
 export interface DmgWindow {
@@ -277,7 +241,7 @@ export interface DmgWindow {
   x?: number
 
   /**
-   * The Y position relative to top of the screen.
+   * The Y position relative to bottom of the screen.
    * @default 100
    */
   y?: number
@@ -294,7 +258,13 @@ export interface DmgWindow {
 }
 
 export interface DmgContent {
+  /**
+   * The device-independent pixel offset from the left of the window to the **center** of the icon.
+   */
   x: number
+  /**
+   * The device-independent pixel offset from the top of the window to the **center** of the icon.
+   */
   y: number
   type?: "link" | "file" | "dir"
 

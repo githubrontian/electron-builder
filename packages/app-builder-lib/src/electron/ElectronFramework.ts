@@ -1,16 +1,16 @@
 import BluebirdPromise from "bluebird-lst"
 import { asArray, executeAppBuilder, log } from "builder-util"
 import { CONCURRENCY, copyDir, DO_NOT_USE_HARD_LINKS, statOrNull, unlinkIfExists } from "builder-util/out/fs"
-import { emptyDir, readdir, remove, rename } from "fs-extra-p"
+import { emptyDir, readdir, remove, rename } from "fs-extra"
 import { Lazy } from "lazy-val"
 import * as path from "path"
-import * as semver from "semver"
-import { AsarIntegrity } from "../asar/integrity"
 import { Configuration } from "../configuration"
-import { Framework, PrepareApplicationStageDirectoryOptions } from "../Framework"
-import { ElectronPlatformName, Packager, Platform, PlatformPackager } from "../index"
+import { BeforeCopyExtraFilesOptions, Framework, PrepareApplicationStageDirectoryOptions } from "../Framework"
+import { Packager, Platform } from "../index"
 import { LinuxPackager } from "../linuxPackager"
 import MacPackager from "../macPackager"
+import { isSafeToUnpackElectronOnRemoteBuildServer } from "../platformPackager"
+import { getTemplatePath } from "../util/pathManager"
 import { createMacApp } from "./electronMac"
 import { computeElectronVersion, getElectronVersionFromInstalled } from "./electronVersion"
 
@@ -52,27 +52,22 @@ function createDownloadOpts(opts: Configuration, platform: ElectronPlatformName,
   }
 }
 
-async function beforeCopyExtraFiles(packager: PlatformPackager<any>, appOutDir: string, asarIntegrity: AsarIntegrity | null, isClearExecStack: boolean) {
+async function beforeCopyExtraFiles(options: BeforeCopyExtraFilesOptions) {
+  const packager = options.packager
+  const appOutDir = options.appOutDir
   if (packager.platform === Platform.LINUX) {
-    const linuxPackager = (packager as LinuxPackager)
-    const executable = path.join(appOutDir, linuxPackager.executableName)
-    await rename(path.join(appOutDir, packager.electronDistExecutableName), executable)
-
-    if (isClearExecStack) {
-      try {
-        await executeAppBuilder(["clear-exec-stack", "--input", executable])
-      }
-      catch (e) {
-        log.debug({error: e}, "cannot clear exec stack")
-      }
+    if (!isSafeToUnpackElectronOnRemoteBuildServer(packager)) {
+      const linuxPackager = (packager as LinuxPackager)
+      const executable = path.join(appOutDir, linuxPackager.executableName)
+      await rename(path.join(appOutDir, "electron"), executable)
     }
   }
   else if (packager.platform === Platform.WINDOWS) {
     const executable = path.join(appOutDir, `${packager.appInfo.productFilename}.exe`)
-    await rename(path.join(appOutDir, `${packager.electronDistExecutableName}.exe`), executable)
+    await rename(path.join(appOutDir, "electron.exe"), executable)
   }
   else {
-    await createMacApp(packager as MacPackager, appOutDir, asarIntegrity)
+    await createMacApp(packager as MacPackager, appOutDir, options.asarIntegrity, (options.platformName as ElectronPlatformName) === "mas")
 
     const wantedLanguages = asArray(packager.platformSpecificBuildOptions.electronLanguages)
     if (wantedLanguages.length === 0) {
@@ -96,31 +91,39 @@ async function beforeCopyExtraFiles(packager: PlatformPackager<any>, appOutDir: 
   }
 }
 
-export async function createElectronFrameworkSupport(configuration: Configuration, packager: Packager): Promise<Framework> {
-  if (configuration.muonVersion != null) {
-    const distMacOsAppName = "Brave.app"
-    return {
-      name: "muon",
-      isDefaultAppIconProvided: true,
-      macOsDefaultTargets: ["zip", "dmg"],
-      defaultAppIdPrefix: "com.electron.",
-      version: configuration.muonVersion!!,
-      distMacOsAppName,
-      prepareApplicationStageDirectory: options => {
-        return unpack(options, {
-          mirror: "https://github.com/brave/muon/releases/download/v",
-          customFilename: `brave-v${options.version}-${options.platformName}-${options.arch}.zip`,
-          isVerifyChecksum: false,
-          ...createDownloadOpts(options.packager.config, options.platformName, options.arch, options.version),
-        }, distMacOsAppName)
-      },
-      isNpmRebuildRequired: true,
-      beforeCopyExtraFiles: (packager: PlatformPackager<any>, appOutDir: string, asarIntegrity: AsarIntegrity | null) => {
-        return beforeCopyExtraFiles(packager, appOutDir, asarIntegrity, false)
-      },
+class ElectronFramework implements Framework {
+  // noinspection JSUnusedGlobalSymbols
+  readonly macOsDefaultTargets = ["zip", "dmg"]
+  // noinspection JSUnusedGlobalSymbols
+  readonly defaultAppIdPrefix = "com.electron."
+  // noinspection JSUnusedGlobalSymbols
+  readonly isCopyElevateHelper = true
+  // noinspection JSUnusedGlobalSymbols
+  readonly isNpmRebuildRequired = true
+
+  constructor(readonly name: string, readonly version: string, readonly distMacOsAppName: string) {
+  }
+
+  getDefaultIcon(platform: Platform) {
+    if (platform === Platform.LINUX) {
+      return path.join(getTemplatePath("icons"), "electron-linux")
+    }
+    else {
+      // default icon is embedded into app skeleton
+      return null
     }
   }
 
+  prepareApplicationStageDirectory(options: PrepareApplicationStageDirectoryOptions) {
+    return unpack(options, createDownloadOpts(options.packager.config, options.platformName, options.arch, this.version), this.distMacOsAppName)
+  }
+
+  beforeCopyExtraFiles(options: BeforeCopyExtraFilesOptions) {
+    return beforeCopyExtraFiles(options)
+  }
+}
+
+export async function createElectronFrameworkSupport(configuration: Configuration, packager: Packager): Promise<Framework> {
   let version = configuration.electronVersion
   if (version == null) {
     // for prepacked app asar no dev deps in the app.asar
@@ -136,20 +139,7 @@ export async function createElectronFrameworkSupport(configuration: Configuratio
     configuration.electronVersion = version
   }
 
-  const distMacOsAppName = "Electron.app"
-  return {
-    isDefaultAppIconProvided: true,
-    macOsDefaultTargets: ["zip", "dmg"],
-    defaultAppIdPrefix: "com.electron.",
-    name: "electron",
-    version,
-    distMacOsAppName,
-    isNpmRebuildRequired: true,
-    prepareApplicationStageDirectory: options => unpack(options, createDownloadOpts(options.packager.config, options.platformName, options.arch, version!!), distMacOsAppName),
-    beforeCopyExtraFiles: (packager: PlatformPackager<any>, appOutDir: string, asarIntegrity: AsarIntegrity | null) => {
-      return beforeCopyExtraFiles(packager, appOutDir, asarIntegrity, semver.lte(version || "1.8.3", "1.8.3"))
-    },
-  }
+  return new ElectronFramework("electron", version, "Electron.app")
 }
 
 async function unpack(prepareOptions: PrepareApplicationStageDirectoryOptions, options: ElectronDownloadOptions, distMacOsAppName: string) {
@@ -168,6 +158,10 @@ async function unpack(prepareOptions: PrepareApplicationStageDirectoryOptions, o
 
   let isFullCleanup = false
   if (dist == null) {
+    if (isSafeToUnpackElectronOnRemoteBuildServer(packager)) {
+      return
+    }
+
     await executeAppBuilder(["unpack-electron", "--configuration", JSON.stringify([options]), "--output", out, "--distMacOsAppName", distMacOsAppName])
   }
   else {

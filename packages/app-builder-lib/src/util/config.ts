@@ -1,11 +1,16 @@
-import { asArray, DebugLogger, InvalidConfigurationError, log, deepAssign } from "builder-util"
+import { DebugLogger, deepAssign, InvalidConfigurationError, log, safeStringifyJson } from "builder-util"
 import { statOrNull } from "builder-util/out/fs"
-import { readJson } from "fs-extra-p"
+import { readJson } from "fs-extra"
 import { Lazy } from "lazy-val"
 import * as path from "path"
-import { getConfig as _getConfig, loadParentConfig, orNullIfFileNotExist, ReadConfigRequest, validateConfig as _validateConfig } from "read-config-file"
+import { getConfig as _getConfig, loadParentConfig, orNullIfFileNotExist, ReadConfigRequest } from "read-config-file"
+import { FileSet } from ".."
 import { Configuration } from "../configuration"
 import { reactCra } from "../presets/rectCra"
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const validateSchema = require("@develar/schema-utils")
+
+declare const PACKAGE_VERSION: string
 
 // https://github.com/electron-userland/electron-builder/issues/1847
 function mergePublish(config: Configuration, configFromOptions: Configuration) {
@@ -31,7 +36,10 @@ function mergePublish(config: Configuration, configFromOptions: Configuration) {
   }
 }
 
-export async function getConfig(projectDir: string, configPath: string | null, configFromOptions: Configuration | null | undefined, packageMetadata: Lazy<{ [key: string]: any } | null> = new Lazy(() => orNullIfFileNotExist(readJson(path.join(projectDir, "package.json"))))): Promise<Configuration> {
+export async function getConfig(projectDir: string,
+                                configPath: string | null,
+                                configFromOptions: Configuration | null | undefined,
+                                packageMetadata: Lazy<{ [key: string]: any } | null> = new Lazy(() => orNullIfFileNotExist(readJson(path.join(projectDir, "package.json"))))): Promise<Configuration> {
   const configRequest: ReadConfigRequest = {packageKey: "build", configFilename: "electron-builder", projectDir, packageMetadata}
   const configAndEffectiveFile = await _getConfig<Configuration>(configRequest, configPath)
   const config = configAndEffectiveFile == null ? {} : configAndEffectiveFile.result
@@ -43,49 +51,149 @@ export async function getConfig(projectDir: string, configPath: string | null, c
     log.info({file: configAndEffectiveFile.configFile == null ? 'package.json ("build" field)' : configAndEffectiveFile.configFile}, "loaded configuration")
   }
 
-  let extendsSpec = config.extends
-  if (extendsSpec == null && extendsSpec !== null) {
+  if (config.extends == null && config.extends !== null) {
     const metadata = await packageMetadata.value || {}
     const devDependencies = metadata.devDependencies
     const dependencies = metadata.dependencies
     if ((dependencies != null && "react-scripts" in dependencies) || (devDependencies != null && "react-scripts" in devDependencies)) {
-      extendsSpec = "react-cra"
-      config.extends = extendsSpec
+      config.extends = "react-cra"
     }
     else if (devDependencies != null && "electron-webpack" in devDependencies) {
-      extendsSpec = "electron-webpack/electron-builder.yml"
-      config.extends = extendsSpec
+      let file = "electron-webpack/out/electron-builder.js"
+      try {
+        file = require.resolve(file)
+      }
+      catch (ignore) {
+        file = require.resolve("electron-webpack/electron-builder.yml")
+      }
+      config.extends = `file:${file}`
     }
-  }
-
-  if (extendsSpec == null) {
-    return deepAssign(getDefaultConfig(), config)
   }
 
   let parentConfig: Configuration | null
-  if (extendsSpec === "react-cra") {
+  if (config.extends === "react-cra") {
     parentConfig = await reactCra(projectDir)
-    log.info({preset: extendsSpec}, "loaded parent configuration")
+    log.info({preset: config.extends}, "loaded parent configuration")
   }
-  else {
-    const parentConfigAndEffectiveFile = await loadParentConfig<Configuration>(configRequest, extendsSpec)
+  else if (config.extends != null) {
+    const parentConfigAndEffectiveFile = await loadParentConfig<Configuration>(configRequest, config.extends)
     log.info({file: parentConfigAndEffectiveFile.configFile}, "loaded parent configuration")
     parentConfig = parentConfigAndEffectiveFile.result
   }
+  else {
+    parentConfig = null
+  }
 
-  // electron-webpack and electrify client config - want to exclude some files
-  // we add client files configuration to main parent file matcher
-  const files = config.files == null ? [] : (Array.isArray(config.files) ? config.files : (typeof config.files === "string" ? [config.files] : []))
-  if (parentConfig.files != null && files.length !== 0 && Array.isArray(parentConfig.files) && parentConfig.files.length > 0) {
-    const mainFileSet = parentConfig.files[0]
-    if (typeof mainFileSet === "object" && (mainFileSet.from == null || mainFileSet.from === ".")) {
-      mainFileSet.filter = asArray(mainFileSet.filter)
-      mainFileSet.filter.push(...asArray(config.files as any))
-      delete (config as any).files
+  return doMergeConfigs(config, parentConfig)
+}
+
+// normalize for easy merge
+function normalizeFiles(configuration: Configuration, name: "files" | "extraFiles" | "extraResources") {
+  let value = configuration[name]
+  if (value == null) {
+    return
+  }
+
+  if (!Array.isArray(value)) {
+    value = [value]
+  }
+
+  itemLoop: for (let i = 0; i < value.length; i++) {
+    let item = value[i]
+    if (typeof item === "string") {
+      // merge with previous if possible
+      if (i !== 0) {
+        let prevItemIndex = i - 1
+        let prevItem: FileSet
+        do {
+          prevItem = value[prevItemIndex--] as FileSet
+        } while (prevItem == null)
+
+        if (prevItem.from == null && prevItem.to == null) {
+          if (prevItem.filter == null) {
+            prevItem.filter = [item]
+          }
+          else {
+            (prevItem.filter as Array<string>).push(item)
+          }
+          value[i] = null as any
+          continue itemLoop
+        }
+      }
+
+      item = {
+        filter: [item],
+      }
+      value[i] = item
+    }
+    else if (Array.isArray(item)) {
+      throw new Error(`${name} configuration is invalid, nested array not expected for index ${i}: ` + item)
+    }
+
+    // make sure that merge logic is not complex - unify different presentations
+    if (item.from === ".") {
+      item.from = undefined
+    }
+
+    if (item.to === ".") {
+      item.to = undefined
+    }
+
+    if (item.filter != null && typeof item.filter === "string") {
+      item.filter = [item.filter]
     }
   }
 
-  return deepAssign(getDefaultConfig(), parentConfig, config)
+  configuration[name] = value.filter(it => it != null)
+}
+
+function mergeFiles(configuration: Configuration, parentConfiguration: Configuration, mergedConfiguration: Configuration, name: "files" | "extraFiles" | "extraResources") {
+  const list = configuration[name] as Array<FileSet> | null
+  const parentList = parentConfiguration[name] as Array<FileSet> | null
+  if (list == null || parentList == null) {
+    return
+  }
+
+  const result = list.slice()
+  mergedConfiguration[name] = result
+
+  itemLoop: for (const item of parentConfiguration.files as Array<FileSet>) {
+    for (const existingItem of list) {
+      if (existingItem.from === item.from && existingItem.to === item.to) {
+        if (item.filter != null) {
+          if (existingItem.filter == null) {
+            existingItem.filter = item.filter.slice()
+          }
+          else {
+            existingItem.filter = (item.filter as Array<string>).concat(existingItem.filter)
+          }
+        }
+
+        continue itemLoop
+      }
+    }
+
+    // existing item not found, simply add
+    result.push(item)
+  }
+}
+
+export function doMergeConfigs(configuration: Configuration, parentConfiguration: Configuration | null) {
+  normalizeFiles(configuration, "files")
+  normalizeFiles(configuration, "extraFiles")
+  normalizeFiles(configuration, "extraResources")
+
+  if (parentConfiguration == null) {
+    return deepAssign(getDefaultConfig(), configuration)
+  }
+
+  normalizeFiles(parentConfiguration, "files")
+  normalizeFiles(parentConfiguration, "extraFiles")
+  normalizeFiles(parentConfiguration, "extraResources")
+
+  const result = deepAssign(getDefaultConfig(), parentConfiguration, configuration)
+  mergeFiles(configuration, parentConfiguration, result, "files")
+  return result
 }
 
 function getDefaultConfig(): Configuration {
@@ -110,24 +218,38 @@ export async function validateConfig(config: Configuration, debugLogger: DebugLo
     }
   }
 
-  // noinspection JSDeprecatedSymbols
-  if (config.npmSkipBuildFromSource === false) {
-    config.buildDependenciesFromSource = false
+  const oldConfig: any = config
+  if (oldConfig.npmSkipBuildFromSource === false) {
+    throw new InvalidConfigurationError(`npmSkipBuildFromSource is deprecated, please use buildDependenciesFromSource"`)
+  }
+  if (oldConfig.appImage != null && oldConfig.appImage.systemIntegration != null) {
+    throw new InvalidConfigurationError(`appImage.systemIntegration is deprecated, https://github.com/TheAssassin/AppImageLauncher is used for desktop integration"`)
   }
 
-  await _validateConfig(config, schemeDataPromise, (message, errors) => {
-    if (debugLogger.isEnabled) {
-      debugLogger.add("invalidConfig", JSON.stringify(errors, null, 2))
-    }
+  // noinspection JSUnusedGlobalSymbols
+  validateSchema(await schemeDataPromise.value, config, {
+    name: `electron-builder ${PACKAGE_VERSION}`,
+    postFormatter: (formattedError: string, error: any): string => {
+      if (debugLogger.isEnabled) {
+        debugLogger.add("invalidConfig", safeStringifyJson(error))
+      }
 
-    return `${message}
+      const site = "https://www.electron.build"
+      let url = `${site}/configuration/configuration`
+      const targets = new Set(["mac", "dmg", "pkg", "mas", "win", "nsis", "appx", "linux", "appimage", "snap"])
+      const dataPath: string = error.dataPath == null ? null : error.dataPath
+      const targetPath = dataPath.startsWith(".") ? dataPath.substr(1).toLowerCase() : null
+      if (targetPath != null && targets.has(targetPath)) {
+        url = `${site}/configuration/${targetPath}`
+      }
 
-How to fix:
-1. Open https://electron.build/configuration/configuration
-2. Search the option name on the page.
-  * Not found? The option was deprecated or not exists (check spelling).
-  * Found? Check that the option in the appropriate place. e.g. "title" only in the "dmg", not in the root.
+      return `${formattedError}\n  How to fix:
+  1. Open ${url}
+  2. Search the option name on the page (or type in into Search to find across the docs).
+    * Not found? The option was deprecated or not exists (check spelling).
+    * Found? Check that the option in the appropriate place. e.g. "title" only in the "dmg", not in the root.
 `
+    },
   })
 }
 
@@ -138,7 +260,7 @@ export async function computeDefaultAppDirectory(projectDir: string, userAppDir:
     const absolutePath = path.resolve(projectDir, userAppDir)
     const stat = await statOrNull(absolutePath)
     if (stat == null) {
-      throw new InvalidConfigurationError(`Application directory ${userAppDir} doesn't exists`)
+      throw new InvalidConfigurationError(`Application directory ${userAppDir} doesn't exist`)
     }
     else if (!stat.isDirectory()) {
       throw new InvalidConfigurationError(`Application directory ${userAppDir} is not a directory`)

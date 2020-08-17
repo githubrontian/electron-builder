@@ -5,8 +5,8 @@ import { copyData, DataSplitter, PartListDataTask } from "./DataSplitter"
 import { DifferentialDownloader } from "./DifferentialDownloader"
 import { Operation, OperationKind } from "./downloadPlanBuilder"
 
-export function executeTasks(differentialDownloader: DifferentialDownloader, tasks: Array<Operation>, out: Writable, oldFileFd: number, reject: (error: Error) => void) {
-  const w = (taskOffset: number) => {
+export function executeTasksUsingMultipleRangeRequests(differentialDownloader: DifferentialDownloader, tasks: Array<Operation>, out: Writable, oldFileFd: number, reject: (error: Error) => void): (taskOffset: number) => void {
+  const w = (taskOffset: number): void => {
     if (taskOffset >= tasks.length) {
       if (differentialDownloader.fileMetadataBuffer != null) {
         out.write(differentialDownloader.fileMetadataBuffer)
@@ -15,8 +15,8 @@ export function executeTasks(differentialDownloader: DifferentialDownloader, tas
       return
     }
 
-    const nextOffset = taskOffset + (differentialDownloader.options.useMultipleRangeRequest === false ? 1 : 1000)
-    _executeTasks(differentialDownloader, {
+    const nextOffset = taskOffset + 1000
+    doExecuteTasks(differentialDownloader, {
       tasks,
       start: taskOffset,
       end: Math.min(tasks.length, nextOffset),
@@ -26,7 +26,7 @@ export function executeTasks(differentialDownloader: DifferentialDownloader, tas
   return w
 }
 
-export function _executeTasks(differentialDownloader: DifferentialDownloader, options: PartListDataTask, out: Writable, resolve: () => void, reject: (error: Error) => void) {
+function doExecuteTasks(differentialDownloader: DifferentialDownloader, options: PartListDataTask, out: Writable, resolve: () => void, reject: (error: Error) => void): void {
   let ranges = "bytes="
   let partCount = 0
   const partIndexToTaskIndex = new Map<number, number>()
@@ -43,7 +43,7 @@ export function _executeTasks(differentialDownloader: DifferentialDownloader, op
 
   if (partCount <= 1) {
     // the only remote range - copy
-    const w = (index: number) => {
+    const w = (index: number): void => {
       if (index >= options.end) {
         resolve()
         return
@@ -55,9 +55,9 @@ export function _executeTasks(differentialDownloader: DifferentialDownloader, op
         copyData(task, out, options.oldFileFd, reject, () => w(index))
       }
       else {
-        const requestOptions = differentialDownloader.createRequestOptions("get")
+        const requestOptions = differentialDownloader.createRequestOptions()
         requestOptions.headers!!.Range = `bytes=${task.start}-${task.end - 1}`
-        const request = differentialDownloader.httpExecutor.doRequest(requestOptions, response => {
+        const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
           if (!checkIsRangesSupported(response, reject)) {
             return
           }
@@ -76,9 +76,9 @@ export function _executeTasks(differentialDownloader: DifferentialDownloader, op
     return
   }
 
-  const requestOptions = differentialDownloader.createRequestOptions("get")
+  const requestOptions = differentialDownloader.createRequestOptions()
   requestOptions.headers!!.Range = ranges.substring(0, ranges.length - 2)
-  const request = differentialDownloader.httpExecutor.doRequest(requestOptions, response => {
+  const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
     if (!checkIsRangesSupported(response, reject)) {
       return
     }
@@ -93,6 +93,13 @@ export function _executeTasks(differentialDownloader: DifferentialDownloader, op
     const dicer = new DataSplitter(out, options, partIndexToTaskIndex, m[1] || m[2], partIndexToLength, resolve)
     dicer.on("error", reject)
     response.pipe(dicer)
+
+    response.on('end', () => {
+      setTimeout(() => {
+        request.abort()
+        reject(new Error("Response ends without calling any handlers"))
+      }, 10000)
+    })
   })
   differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
   request.end()

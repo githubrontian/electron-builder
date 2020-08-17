@@ -1,13 +1,12 @@
 import { path7za } from "7zip-bin"
-import { Arch, debug, exec, log, spawn } from "builder-util"
+import { Arch, debug, exec, log, spawn, isEmptyOrSpaces } from "builder-util"
 import { copyFile, walk } from "builder-util/out/fs"
 import { compute7zCompressArgs } from "app-builder-lib/out/targets/archive"
 import { execWine, prepareWindowsExecutableArgs as prepareArgs } from "app-builder-lib/out/wine"
 import { WinPackager } from "app-builder-lib/out/winPackager"
-import { createWriteStream, ensureDir, remove, stat, unlink, writeFile } from "fs-extra-p"
+import { createWriteStream, ensureDir, remove, stat, unlink, writeFile } from "fs-extra"
 import * as path from "path"
-
-const archiver = require("archiver")
+import archiver from "archiver"
 
 export function convertVersion(version: string): string {
   const parts = version.split("-")
@@ -70,6 +69,10 @@ export class SquirrelBuilder {
         .then(() => ensureDir(outputDirectory))
     ])
 
+    if (isEmptyOrSpaces(options.description)) {
+      options.description = options.productName
+    }
+
     if (options.remoteReleases) {
       await syncReleases(outputDirectory, options)
     }
@@ -90,7 +93,7 @@ export class SquirrelBuilder {
 
     const embeddedArchiveFile = await this.createEmbeddedArchiveFile(nupkgPath, dirToArchive)
 
-    await execWine(path.join(options.vendorPath, "WriteZipToSetup.exe"), [setupPath, embeddedArchiveFile])
+    await execWine(path.join(options.vendorPath, "WriteZipToSetup.exe"), null, [setupPath, embeddedArchiveFile])
 
     await packager.signAndEditResources(setupPath, arch, outDir)
     if (options.msi && process.platform === "win32") {
@@ -262,7 +265,7 @@ async function encodedZip(archive: any, dir: string, prefix: string, vendorPath:
       if (file.endsWith(".exe") && !file.includes("squirrel.exe") && !relativeSafeFilePath.includes("/")) {
         const tempFile = await packager.getTempFile("stub.exe")
         await copyFile(path.join(vendorPath, "StubExecutable.exe"), tempFile)
-        await execWine(path.join(vendorPath, "WriteZipToSetup.exe"), ["--copy-stub-resources", file, tempFile])
+        await execWine(path.join(vendorPath, "WriteZipToSetup.exe"), null, ["--copy-stub-resources", file, tempFile])
         await packager.sign(tempFile)
 
         archive._append(tempFile, {

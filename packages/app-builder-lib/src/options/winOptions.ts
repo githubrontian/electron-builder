@@ -1,5 +1,5 @@
 import { PlatformSpecificBuildOptions, TargetConfigType } from "../index"
-import { CustomWindowsSign } from "../windowsCodeSign"
+import { CustomWindowsSign } from "../codeSign/windowsCodeSign"
 
 export interface WindowsConfiguration extends PlatformSpecificBuildOptions {
   /**
@@ -56,12 +56,12 @@ export interface WindowsConfiguration extends PlatformSpecificBuildOptions {
   readonly additionalCertificateFile?: string | null
   /**
    * The URL of the RFC 3161 time stamp server.
-   * @default http://timestamp.comodoca.com/rfc3161
+   * @default http://timestamp.digicert.com
    */
   readonly rfc3161TimeStampServer?: string | null
   /**
    * The URL of the time stamp server.
-   * @default http://timestamp.verisign.com/scripts/timstamp.dll
+   * @default http://timestamp.digicert.com
    */
   readonly timeStampServer?: string | null
 

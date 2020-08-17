@@ -1,14 +1,14 @@
 import BluebirdPromise from "bluebird-lst"
-import { AsyncTaskManager, log, executeAppBuilderAsJson } from "builder-util"
-import { CONCURRENCY, FileCopier, Link, MAX_FILE_REQUESTS, FileTransformer, statOrNull, walk } from "builder-util/out/fs"
-import { ensureDir, readlink, Stats, symlink } from "fs-extra-p"
+import { AsyncTaskManager, log } from "builder-util"
+import { CONCURRENCY, FileCopier, FileTransformer, Link, MAX_FILE_REQUESTS, statOrNull, walk } from "builder-util/out/fs"
+import { ensureDir, readlink, Stats, symlink } from "fs-extra"
 import * as path from "path"
 import { isLibOrExe } from "../asar/unpackDetector"
 import { Platform } from "../core"
-import { Packager } from "../packager"
-import { PlatformPackager } from "../platformPackager"
 import { excludedExts, FileMatcher } from "../fileMatcher"
 import { createElectronCompilerHost, NODE_MODULES_PATTERN } from "../fileTransformer"
+import { Packager } from "../packager"
+import { PlatformPackager } from "../platformPackager"
 import { AppFileWalker } from "./AppFileWalker"
 import { NodeModuleCopyHelper } from "./NodeModuleCopyHelper"
 
@@ -30,11 +30,14 @@ export function getDestinationPath(file: string, fileSet: ResolvedFileSet) {
       // hoisted node_modules
       // not lastIndexOf, to ensure that nested module (top-level module depends on) copied to parent node_modules, not to top-level directory
       // project https://github.com/angexis/punchcontrol/commit/cf929aba55c40d0d8901c54df7945e1d001ce022
-      const index = file.indexOf(NODE_MODULES_PATTERN)
+      let index = file.indexOf(NODE_MODULES_PATTERN)
+      if (index < 0 && file.endsWith(`${path.sep}node_modules`)) {
+        index = file.length - 13
+      }
       if (index < 0) {
         throw new Error(`File "${file}" not under the source directory "${fileSet.src}"`)
       }
-      return dest + file.substring(index + 1 /* leading slash */)
+      return dest + file.substring(index)
     }
   }
 }
@@ -180,29 +183,23 @@ function validateFileSet(fileSet: ResolvedFileSet): ResolvedFileSet {
 
 /** @internal */
 export async function computeNodeModuleFileSets(platformPackager: PlatformPackager<any>, mainMatcher: FileMatcher): Promise<Array<ResolvedFileSet>> {
-  // const productionDeps = await platformPackager.info.productionDeps.value
-
-  const deps = await executeAppBuilderAsJson<Array<any>>(["node-dep-tree", "--dir", platformPackager.info.appDir])
+  const deps = await platformPackager.info.getNodeDependencyInfo(platformPackager.platform).value
   const nodeModuleExcludedExts = getNodeModuleExcludedExts(platformPackager)
-  // mapSeries instead of map because copyNodeModules is concurrent and so, no need to increase queue/pressure
-  return await BluebirdPromise.mapSeries(deps, async info => {
+  // serial execution because copyNodeModules is concurrent and so, no need to increase queue/pressure
+  const result = new Array<ResolvedFileSet>()
+  let index = 0
+  for (const info of deps) {
     const source = info.dir
-    let destination: string
-    if (source.length > mainMatcher.from.length && source.startsWith(mainMatcher.from) && source[mainMatcher.from.length] === path.sep) {
-      destination = getDestinationPath(source, {src: mainMatcher.from, destination: mainMatcher.to, files: [], metadata: null as any})
-    }
-    else {
-      destination = mainMatcher.to + path.sep + "node_modules"
-    }
+    const destination = getDestinationPath(source, {src: mainMatcher.from, destination: mainMatcher.to, files: [], metadata: null as any})
 
     // use main matcher patterns, so, user can exclude some files in such hoisted node modules
     // source here includes node_modules, but pattern base should be without because users expect that pattern "!node_modules/loot-core/src{,/**/*}" will work
     const matcher = new FileMatcher(path.dirname(source), destination, mainMatcher.macroExpander, mainMatcher.patterns)
     const copier = new NodeModuleCopyHelper(matcher, platformPackager.info)
-    const names = info.deps
-    const files = await copier.collectNodeModules(source, names, nodeModuleExcludedExts)
-    return validateFileSet({src: source, destination, files, metadata: copier.metadata})
-  })
+    const files = await copier.collectNodeModules(source, info.deps.map(it => it.name), nodeModuleExcludedExts)
+    result[index++] = validateFileSet({src: source, destination, files, metadata: copier.metadata})
+  }
+  return result
 }
 
 async function compileUsingElectronCompile(mainFileSet: ResolvedFileSet, packager: Packager): Promise<ResolvedFileSet> {

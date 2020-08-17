@@ -1,26 +1,26 @@
-import BluebirdPromise from "bluebird-lst"
 import { addValue, Arch, archFromString, AsyncTaskManager, DebugLogger, deepAssign, exec, InvalidConfigurationError, log, safeStringifyJson, serializeToYaml, TmpDir } from "builder-util"
 import { CancellationToken } from "builder-util-runtime"
-import { exists } from "builder-util/out/fs"
 import { executeFinally, orNullIfFileNotExist } from "builder-util/out/promise"
 import { EventEmitter } from "events"
-import { ensureDir, outputFile } from "fs-extra-p"
+import { mkdirs, chmod, outputFile } from "fs-extra"
 import isCI from "is-ci"
 import { Lazy } from "lazy-val"
 import * as path from "path"
+import { getArtifactArchName } from "builder-util/out/arch"
 import { AppInfo } from "./appInfo"
 import { readAsarJson } from "./asar/asar"
 import { createElectronFrameworkSupport } from "./electron/ElectronFramework"
+import { LibUiFramework } from "./frameworks/LibUiFramework"
 import { AfterPackContext, Configuration, Framework, Platform, SourceRepositoryInfo, Target } from "./index"
 import MacPackager from "./macPackager"
 import { Metadata } from "./options/metadata"
-import { ArtifactCreated, PackagerOptions } from "./packagerApi"
+import { ArtifactBuildStarted, ArtifactCreated, PackagerOptions } from "./packagerApi"
 import { PlatformPackager, resolveFunction } from "./platformPackager"
-import { createProtonFrameworkSupport } from "./ProtonFramework"
+import { ProtonFramework } from "./ProtonFramework"
 import { computeArchToTargetNamesMap, createTargets, NoOpTarget } from "./targets/targetFactory"
 import { computeDefaultAppDirectory, getConfig, validateConfig } from "./util/config"
 import { expandMacro } from "./util/macroExpander"
-import { Dependency, getProductionDependencies } from "./util/packageDependencies"
+import { createLazyProductionDeps, NodeModuleDirInfo } from "./util/packageDependencies"
 import { checkMetadata, readPackageJson } from "./util/packageMetadata"
 import { getRepositoryInfo } from "./util/repositoryInfo"
 import { getGypEnv, installOrRebuild } from "./util/yarn"
@@ -33,11 +33,30 @@ function addHandler(emitter: EventEmitter, event: string, handler: (...args: Arr
 declare const PACKAGE_VERSION: string
 
 async function createFrameworkInfo(configuration: Configuration, packager: Packager): Promise<Framework> {
-  if (configuration.protonNodeVersion != null) {
-    return createProtonFrameworkSupport(configuration.protonNodeVersion!!, packager.appInfo)
+  let framework = configuration.framework
+  if (framework != null) {
+    framework = framework.toLowerCase()
+  }
+
+  let nodeVersion = configuration.nodeVersion
+  if (framework === "electron" || framework == null) {
+    return await createElectronFrameworkSupport(configuration, packager)
+  }
+
+  if (nodeVersion == null || nodeVersion === "current") {
+    nodeVersion = process.versions.node
+  }
+
+  const distMacOsName = `${packager.appInfo.productFilename}.app`
+  const isUseLaunchUi = configuration.launchUiVersion !== false
+  if (framework === "proton" || framework === "proton-native") {
+    return new ProtonFramework(nodeVersion, distMacOsName, isUseLaunchUi)
+  }
+  else if (framework === "libui") {
+    return new LibUiFramework(nodeVersion, distMacOsName, isUseLaunchUi)
   }
   else {
-    return await createElectronFrameworkSupport(configuration, packager)
+    throw new InvalidConfigurationError(`Unknown framework: ${framework}`)
   }
 }
 
@@ -100,27 +119,28 @@ export class Packager {
     return this._repositoryInfo.value
   }
 
-  private _productionDeps: Lazy<Array<Dependency>> | null = null
+  private nodeDependencyInfo = new Map<string, Lazy<Array<any>>>()
 
-  private get productionDeps(): Lazy<Array<Dependency>> {
-    let result = this._productionDeps
+  getNodeDependencyInfo(platform: Platform | null): Lazy<Array<NodeModuleDirInfo>> {
+    let key = ""
+    let excludedDependencies: Array<string> | null = null
+    if (platform != null && this.framework.getExcludedDependencies != null) {
+      excludedDependencies = this.framework.getExcludedDependencies(platform)
+      if (excludedDependencies != null) {
+        key += `-${platform.name}`
+      }
+    }
+
+    let result = this.nodeDependencyInfo.get(key)
     if (result == null) {
-      // https://github.com/electron-userland/electron-builder/issues/2551
-      result = new Lazy(async () => {
-        if (this.config.beforeBuild == null || (await exists(path.join(this.appDir, "node_modules")))) {
-          return await getProductionDependencies(this.appDir)
-        }
-        else {
-          return []
-        }
-      })
-      this._productionDeps = result
+      result = createLazyProductionDeps(this.appDir, excludedDependencies)
+      this.nodeDependencyInfo.set(key, result)
     }
     return result
   }
 
   stageDirPathCustomizer: (target: Target, packager: PlatformPackager<any>, arch: Arch) => string = (target, packager, arch) => {
-    return path.join(target.outDir, `__${target.name}-${Arch[arch]}`)
+    return path.join(target.outDir, `__${target.name}-${getArtifactArchName(arch, target.name)}`)
   }
 
   private _buildResourcesDir: string | null = null
@@ -141,6 +161,12 @@ export class Packager {
   private _framework: Framework | null = null
   get framework(): Framework {
     return this._framework!!
+  }
+
+  private readonly toDispose: Array<() => Promise<void>> = []
+
+  disposeOnBuildFinish(disposer: () => Promise<void>) {
+    this.toDispose.push(disposer)
   }
 
   //noinspection JSUnusedGlobalSymbols
@@ -211,7 +237,7 @@ export class Packager {
     }
 
     try {
-      log.info({version: PACKAGE_VERSION}, "electron-builder")
+      log.info({version: PACKAGE_VERSION, os: require("os").release()}, "electron-builder")
     }
     catch (e) {
       // error in dev mode without babel
@@ -230,8 +256,39 @@ export class Packager {
     return this
   }
 
-  dispatchArtifactCreated(event: ArtifactCreated) {
+  async callArtifactBuildStarted(event: ArtifactBuildStarted, logFields?: any): Promise<void> {
+    log.info(logFields || {
+      target: event.targetPresentableName,
+      arch: event.arch == null ? null : Arch[event.arch],
+      file: log.filePath(event.file),
+    }, "building")
+    const handler = resolveFunction(this.config.artifactBuildStarted, "artifactBuildStarted")
+    if (handler != null) {
+      await Promise.resolve(handler(event))
+    }
+  }
+
+  /**
+   * Only for sub artifacts (update info), for main artifacts use `callArtifactBuildCompleted`.
+   */
+  dispatchArtifactCreated(event: ArtifactCreated): void {
     this.eventEmitter.emit("artifactCreated", event)
+  }
+
+  async callArtifactBuildCompleted(event: ArtifactCreated): Promise<void> {
+    this.dispatchArtifactCreated(event)
+
+    const handler = resolveFunction(this.config.artifactBuildCompleted, "artifactBuildCompleted")
+    if (handler != null) {
+      await Promise.resolve(handler(event))
+    }
+  }
+
+  async callAppxManifestCreated(path: string): Promise<void> {
+    const handler = resolveFunction(this.config.appxManifestCreated, "appxManifestCreated")
+    if (handler != null) {
+      await Promise.resolve(handler(path))
+    }
   }
 
   async build(): Promise<BuildResult> {
@@ -294,10 +351,12 @@ export class Packager {
     this._appInfo = new AppInfo(this, null)
     this._framework = await createFrameworkInfo(this.config, this)
 
-    const outDir = path.resolve(this.projectDir, expandMacro(configuration.directories!!.output!!, null, this._appInfo))
+    const commonOutDirWithoutPossibleOsMacro = path.resolve(this.projectDir, expandMacro(configuration.directories!!.output!!, null, this._appInfo, {
+      os: "",
+    }))
 
     if (!isCI && (process.stdout as any).isTTY) {
-      const effectiveConfigFile = path.join(outDir, "builder-effective-config.yaml")
+      const effectiveConfigFile = path.join(commonOutDirWithoutPossibleOsMacro, "builder-effective-config.yaml")
       log.info({file: log.filePath(effectiveConfigFile)}, "writing effective config")
       await outputFile(effectiveConfigFile, getSafeEffectiveConfig(configuration))
     }
@@ -310,15 +369,23 @@ export class Packager {
       }
     })
 
-    const platformToTargets = await executeFinally(this.doBuild(outDir), async () => {
+    this.disposeOnBuildFinish(() => this.tempDirManager.cleanup())
+    const platformToTargets = await executeFinally(this.doBuild(), async () => {
       if (this.debugLogger.isEnabled) {
-        await this.debugLogger.save(path.join(outDir, "builder-debug.yml"))
+        await this.debugLogger.save(path.join(commonOutDirWithoutPossibleOsMacro, "builder-debug.yml"))
       }
-      await this.tempDirManager.cleanup()
+
+      const toDispose = this.toDispose.slice()
+      this.toDispose.length = 0
+      for (const disposer of toDispose) {
+        await disposer().catch(e => {
+          log.warn({error: e}, "cannot dispose")
+        })
+      }
     })
 
     return {
-      outDir,
+      outDir: commonOutDirWithoutPossibleOsMacro,
       artifactPaths: Array.from(artifactPaths),
       platformToTargets,
       configuration,
@@ -340,13 +407,13 @@ export class Packager {
     throw new Error(`Cannot find package.json in the ${path.dirname(appPackageFile)}`)
   }
 
-  private async doBuild(outDir: string): Promise<Map<Platform, Map<string, Target>>> {
+  private async doBuild(): Promise<Map<Platform, Map<string, Target>>> {
     const taskManager = new AsyncTaskManager(this.cancellationToken)
 
     const platformToTarget = new Map<Platform, Map<string, Target>>()
     const createdOutDirs = new Set<string>()
 
-    for (const [platform, archToType] of this.options.targets!) {
+    for (const [platform, archToType] of this.options.targets!!) {
       if (this.cancellationToken.cancelled) {
         break
       }
@@ -359,7 +426,7 @@ export class Packager {
       const nameToTarget: Map<string, Target> = new Map()
       platformToTarget.set(platform, nameToTarget)
 
-      for (const [arch, targetNames] of computeArchToTargetNamesMap(archToType, packager.platformSpecificBuildOptions, platform)) {
+      for (const [arch, targetNames] of computeArchToTargetNamesMap(archToType, packager, platform)) {
         if (this.cancellationToken.cancelled) {
           break
         }
@@ -370,6 +437,8 @@ export class Packager {
           break
         }
 
+        // support os and arch macro in output value
+        const outDir = path.resolve(this.projectDir, packager.expandMacro(this._configuration!!.directories!!.output!!, Arch[arch]))
         const targetList = createTargets(nameToTarget, targetNames.length === 0 ? packager.defaultTarget : targetNames, outDir, packager)
         await createOutDirIfNeed(targetList, createdOutDirs)
         await packager.pack(outDir, arch, targetList, taskManager)
@@ -394,14 +463,12 @@ export class Packager {
     }
 
     switch (platform) {
-      case Platform.MAC:
-      {
+      case Platform.MAC: {
         const helperClass: typeof MacPackager = require("./macPackager").default
         return new helperClass(this)
       }
 
-      case Platform.WINDOWS:
-      {
+      case Platform.WINDOWS: {
         const helperClass: typeof WinPackager = require("./winPackager").WinPackager
         return new helperClass(this)
       }
@@ -419,7 +486,7 @@ export class Packager {
       return
     }
 
-    const frameworkInfo = {version: this.framework.version, useCustomDist: this.config.muonVersion == null}
+    const frameworkInfo = {version: this.framework.version, useCustomDist: true}
     const config = this.config
     if (config.nodeGypRebuild === true) {
       log.info({arch: Arch[arch]}, "executing node-gyp rebuild")
@@ -429,7 +496,7 @@ export class Packager {
     }
 
     if (config.npmRebuild === false) {
-      log.info({reason: "npmRebuild is set to false"}, "skipped app dependencies rebuild")
+      log.info({reason: "npmRebuild is set to false"}, "skipped dependencies rebuild")
       return
     }
 
@@ -450,26 +517,29 @@ export class Packager {
     }
 
     if (config.buildDependenciesFromSource === true && platform.nodeName !== process.platform) {
-      log.info({reason: "platform is different and buildDependenciesFromSource is set to true"}, "skipped app dependencies rebuild")
+      log.info({reason: "platform is different and buildDependenciesFromSource is set to true"}, "skipped dependencies rebuild")
     }
     else {
       await installOrRebuild(config, this.appDir, {
         frameworkInfo,
         platform: platform.nodeName,
         arch: Arch[arch],
-        productionDeps: this.productionDeps,
+        productionDeps: this.getNodeDependencyInfo(null),
       })
     }
   }
 
-  afterPack(context: AfterPackContext): Promise<any> {
+  async afterPack(context: AfterPackContext): Promise<any> {
     const afterPack = resolveFunction(this.config.afterPack, "afterPack")
     const handlers = this.afterPackHandlers.slice()
     if (afterPack != null) {
       // user handler should be last
       handlers.push(afterPack)
     }
-    return BluebirdPromise.each(handlers, it => it(context))
+
+    for (const handler of handlers) {
+      await Promise.resolve(handler(context))
+    }
   }
 }
 
@@ -487,13 +557,15 @@ function createOutDirIfNeed(targetList: Array<Target>, createdOutDirs: Set<strin
     }
   }
 
-  if (ourDirs.size > 0) {
-    return BluebirdPromise.map(Array.from(ourDirs).sort(), it => {
-      createdOutDirs.add(it)
-      return ensureDir(it)
-    })
+  if (ourDirs.size === 0) {
+    return Promise.resolve()
   }
-  return Promise.resolve()
+
+  return Promise.all(Array.from(ourDirs).sort().map(dir => {
+    return mkdirs(dir)
+      .then(() => chmod(dir, 0o755) /* set explicitly */)
+      .then(() => createdOutDirs.add(dir))
+  }))
 }
 
 export interface BuildResult {

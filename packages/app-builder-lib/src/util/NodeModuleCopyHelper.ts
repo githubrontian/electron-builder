@@ -1,14 +1,14 @@
 import BluebirdPromise from "bluebird-lst"
 import { CONCURRENCY } from "builder-util/out/fs"
-import { lstat, readdir } from "fs-extra-p"
+import { lstat, readdir } from "fs-extra"
 import * as path from "path"
 import { excludedNames, FileMatcher } from "../fileMatcher"
 import { Packager } from "../packager"
 import { resolveFunction } from "../platformPackager"
 import { FileCopyHelper } from "./AppFileWalker"
 
-const excludedFiles = new Set([".DS_Store", "node_modules" /* already in the queue */, "CHANGELOG.md", "ChangeLog", "changelog.md", "binding.gyp", ".npmignore"].concat(excludedNames.split(",")))
-const topLevelExcludedFiles = new Set(["test.js", "karma.conf.js", ".coveralls.yml", "README.md", "readme.markdown", "README", "readme.md", "readme", "test", "__tests__", "tests", "powered-test", "example", "examples", ".bin"])
+const excludedFiles = new Set([".DS_Store", "node_modules" /* already in the queue */, "CHANGELOG.md", "ChangeLog", "changelog.md", "Changelog.md", "Changelog", "binding.gyp", ".npmignore"].concat(excludedNames.split(",")))
+const topLevelExcludedFiles = new Set(["test.js", "karma.conf.js", ".coveralls.yml", "README.md", "readme.markdown", "README", "readme.md", "Readme.md", "Readme", "readme", "test", "__tests__", "tests", "powered-test", "example", "examples", ".bin"])
 
 /** @internal */
 export class NodeModuleCopyHelper extends FileCopyHelper {

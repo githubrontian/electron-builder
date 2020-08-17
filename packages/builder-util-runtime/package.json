@@ -1,6 +1,6 @@
 {
   "name": "builder-util-runtime",
-  "version": "0.0.0-semantic-release",
+  "version": "8.7.2",
   "main": "out/index.js",
   "author": "Vladimir Krivosheev",
   "license": "MIT",
@@ -11,13 +11,15 @@
     "out"
   ],
   "engines": {
-    "node": ">=6.0.0"
+    "node": ">=8.2.5"
   },
   "dependencies": {
-    "debug": "^4.1.0",
-    "fs-extra-p": "^7.0.0",
-    "bluebird-lst": "^1.0.6",
+    "debug": "^4.2.0",
     "sax": "^1.2.4"
+  },
+  "devDependencies": {
+    "@types/debug": "^4.1.5",
+    "@types/sax": "^1.2.1"
   },
   "types": "./out/index.d.ts"
 }

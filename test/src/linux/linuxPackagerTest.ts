@@ -1,50 +1,59 @@
 import { Arch, build, Platform } from "electron-builder"
-import { copyFile, move, outputFile, remove, rename } from "fs-extra-p"
+import { outputFile, remove } from "fs-extra"
 import * as path from "path"
+import { GenericServerOptions } from "builder-util-runtime"
 import { assertThat } from "../helpers/fileAssert"
 import { app, appThrows, copyTestAsset, modifyPackageJson } from "../helpers/packTester"
 import { ELECTRON_VERSION } from "../helpers/testConfig"
+import { promises as fs } from "fs"
 
 const appImageTarget = Platform.LINUX.createTarget("appimage")
+
+// test update info file name
+const testPublishConfig: GenericServerOptions = {
+  provider: "generic",
+  url: "https://example.com/download",
+}
 
 test.ifNotWindows("AppImage", app({
   targets: appImageTarget,
   config: {
-    publish: {
-      provider: "generic",
-      url: "https://example.com/downloads",
-    },
+    publish: testPublishConfig,
   },
 }))
 
+// also test os macro in output dir
 test.ifAll.ifNotWindows.ifNotCiMac("AppImage ia32", app({
   targets: Platform.LINUX.createTarget("Appimage", Arch.ia32),
   config: {
-    publish: {
-      provider: "generic",
-      url: "https://example.com/downloads"
+    directories: {
+      // tslint:disable:no-invalid-template-strings
+      output: "dist/${os}",
     },
+    publish: testPublishConfig,
   },
 }))
 
 test.ifAll.ifNotWindows.ifNotCiMac("AppImage arm, max compression", app({
   targets: Platform.LINUX.createTarget("Appimage", Arch.armv7l),
   config: {
-    // test update info file name
-    publish: {
-      provider: "generic",
-      url: "https://example.com/downloads"
-    },
+    publish: testPublishConfig,
     compression: "maximum",
   },
 }))
 
-test.ifNotWindows.ifNotCiMac.ifAll("AppImage - doNotAsk system integration", app({
+test.ifNotWindows.ifNotCiMac.ifAll("AppImage - deprecated systemIntegration", appThrows({
   targets: appImageTarget,
   config: {
     appImage: {
       systemIntegration: "doNotAsk",
-    },
+    } as any,
+  },
+}))
+
+test.ifNotWindows.ifNotCiMac.ifAll("text license and file associations", app({
+  targets: appImageTarget,
+  config: {
     extraResources: {
       from: "build/icons"
     },
@@ -55,7 +64,7 @@ test.ifNotWindows.ifNotCiMac.ifAll("AppImage - doNotAsk system integration", app
         mimeType: "application/x-example",
       }
     ],
-  }
+  },
 }, {
   projectDirCreated: projectDir => {
     return Promise.all([
@@ -116,10 +125,14 @@ test.ifNotWindows("icons from ICNS (mac)", app({
     mac: {
       icon: "resources/time.icns",
     },
+    // test https://github.com/electron-userland/electron-builder/issues/3510
+    linux: {
+      artifactName: "app-${version}-${arch}.${ext}",
+    }
   },
 }, {
   projectDirCreated: async projectDir => {
-    await move(path.join(projectDir, "build", "icon.icns"), path.join(projectDir, "resources", "time.icns"))
+    await fs.mkdir(path.join(projectDir, "resources"), {recursive: true}).then(() => fs.rename(path.join(projectDir, "build", "icon.icns"), path.join(projectDir, "resources", "time.icns")))
     await remove(path.join(projectDir, "build"))
   },
   packed: async context => {
@@ -146,7 +159,7 @@ test.ifNotWindows("icons from dir and one icon with suffix", app({
   },
 }, {
   projectDirCreated: async projectDir => {
-    await copyFile(path.join(projectDir, "build", "icons", "16x16.png"), path.join(projectDir, "build", "icons", "16x16-dev.png"))
+    await fs.copyFile(path.join(projectDir, "build", "icons", "16x16.png"), path.join(projectDir, "build", "icons", "16x16-dev.png"))
   },
   packed: async context => {
     const projectDir = context.getResources(Platform.LINUX)
@@ -165,9 +178,9 @@ test.ifNotWindows("icons dir with images without size in the filename", app({
   },
 }, {
   projectDirCreated: async projectDir => {
-    await rename(path.join(projectDir, "build", "icons", "256x256.png"), path.join(projectDir, "build", "icon.png"))
+    await fs.rename(path.join(projectDir, "build", "icons", "256x256.png"), path.join(projectDir, "build", "icon.png"))
     await remove(path.join(projectDir, "build", "icons"))
-    await rename(path.join(projectDir, "build"), path.join(projectDir, "icons"))
+    await fs.rename(path.join(projectDir, "build"), path.join(projectDir, "icons"))
   },
   packed: async context => {
     const projectDir = context.getResources(Platform.LINUX)
@@ -186,7 +199,7 @@ test.ifNotWindows("icons from ICNS", app({
   packed: async context => {
     const projectDir = context.getResources(Platform.LINUX)
 
-    await rename(path.join(projectDir, "electron.asar"), path.join(projectDir, "someAsarFile.asar"))
+    await remove(path.join(projectDir, "inspector"))
 
     await build({
       targets: appImageTarget,
@@ -200,7 +213,6 @@ test.ifNotWindows("icons from ICNS", app({
     })
 
     await assertThat(path.join(projectDir, "dist")).isDirectory()
-    await assertThat(path.join(projectDir, "dist", "linux-unpacked", "resources", "someAsarFile.asar")).isFile()
   },
 }))
 

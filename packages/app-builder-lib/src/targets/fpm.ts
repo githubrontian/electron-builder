@@ -1,17 +1,19 @@
 import { path7za } from "7zip-bin"
-import { appBuilderPath } from "app-builder-bin"
-import { Arch, debug, exec, isMacOsSierra, log, smarten, TmpDir, toLinuxArchString, use } from "builder-util"
-import { computeEnv } from "../util/bundledTool"
+import { Arch, executeAppBuilder, log, TmpDir, toLinuxArchString, use } from "builder-util"
 import { unlinkIfExists } from "builder-util/out/fs"
-import { ensureDir, outputFile, readFile } from "fs-extra-p"
+import { ensureDir, outputFile, readFile } from "fs-extra"
 import * as path from "path"
 import { DebOptions, LinuxTargetSpecificOptions } from ".."
+import { smarten } from "../appInfo"
 import { Target } from "../core"
 import * as errorMessages from "../errorMessages"
 import { LinuxPackager } from "../linuxPackager"
+import { objectToArgs } from "../util/appBuilder"
+import { computeEnv } from "../util/bundledTool"
+import { isMacOsSierra } from "../util/macosVersion"
 import { getTemplatePath } from "../util/pathManager"
 import { installPrefix, LinuxTargetHelper } from "./LinuxTargetHelper"
-import { fpmPath, getLinuxToolsPath } from "./tools"
+import { getLinuxToolsPath } from "./tools"
 
 interface FpmOptions {
   maintainer: string | undefined
@@ -88,8 +90,6 @@ export default class FpmTarget extends Target {
   }
 
   async build(appOutDir: string, arch: Arch): Promise<any> {
-    const fpmMetaInfoOptions = await this.computeFpmMetaInfoOptions()
-
     const target = this.name
 
     // tslint:disable:no-invalid-template-strings
@@ -104,26 +104,27 @@ export default class FpmTarget extends Target {
       isUseArchIfX64 = true
     }
 
-    const artifactPath = path.join(this.outDir, this.packager.expandArtifactNamePattern(this.options, target, arch, nameFormat, !isUseArchIfX64))
+    const packager = this.packager
+    const artifactPath = path.join(this.outDir, packager.expandArtifactNamePattern(this.options, target, arch, nameFormat, !isUseArchIfX64))
 
-    this.logBuilding(target, artifactPath, arch)
+    await packager.info.callArtifactBuildStarted({
+      targetPresentableName: target,
+      file: artifactPath,
+      arch,
+    })
 
     await unlinkIfExists(artifactPath)
-    if (this.packager.packagerOptions.prepackaged != null) {
+    if (packager.packagerOptions.prepackaged != null) {
       await ensureDir(this.outDir)
     }
 
     const scripts = await this.scriptFiles
-    const packager = this.packager
     const appInfo = packager.appInfo
     const options = this.options
     const synopsis = options.synopsis
     const args = [
-      "-s", "dir",
-      "-t", target,
-      "--architecture", (target === "pacman" && arch === Arch.ia32) ? "i686" : toLinuxArchString(arch),
+      "--architecture", toLinuxArchString(arch, target),
       "--name", appInfo.linuxPackageName,
-      "--force",
       "--after-install", scripts[0],
       "--after-remove", scripts[1],
       "--description", smarten(target === "rpm" ? this.helper.getDescription(options)! : `${synopsis || ""}\n ${this.helper.getDescription(options)}`),
@@ -131,68 +132,45 @@ export default class FpmTarget extends Target {
       "--package", artifactPath,
     ]
 
-    for (const key of Object.keys(fpmMetaInfoOptions)) {
-      const value = (fpmMetaInfoOptions as any)[key]
-      if (value != null) {
-        args.push(`--${key}`, value)
-      }
-    }
-
-    if (debug.enabled) {
-      args.push(
-        "--log", "debug",
-        "--debug")
-    }
+    objectToArgs(args, await this.computeFpmMetaInfoOptions() as any)
 
     const packageCategory = options.packageCategory
-    if (packageCategory != null && packageCategory !== null) {
+    if (packageCategory != null) {
       args.push("--category", packageCategory)
     }
 
-    const compression = options.compression
     if (target === "deb") {
-      args.push("--deb-compression", compression || "xz")
       use((options as DebOptions).priority, it => args.push("--deb-priority", it!))
     }
     else if (target === "rpm") {
-      args.push("--rpm-compression", (compression === "xz" ? "xzmt" : compression) || "xzmt")
-      args.push("--rpm-os", "linux")
-
       if (synopsis != null) {
         args.push("--rpm-summary", smarten(synopsis))
       }
     }
 
-    // noinspection JSDeprecatedSymbols
-    let depends = options.depends || this.packager.platformSpecificBuildOptions.depends
-    if (depends == null) {
-      if (target === "deb") {
-        depends = ["gconf2", "gconf-service", "libnotify4", "libappindicator1", "libxtst6", "libnss3", "libxss1"]
-      }
-      else if (target === "pacman") {
-        // noinspection SpellCheckingInspection
-        depends = ["c-ares", "ffmpeg", "gtk3", "http-parser", "libevent", "libvpx", "libxslt", "libxss", "minizip", "nss", "re2", "snappy", "libnotify", "libappindicator-gtk2", "libappindicator-gtk3", "libappindicator-sharp"]
-      }
-      else if (target === "rpm") {
-        // noinspection SpellCheckingInspection
-        depends = ["libnotify", "libappindicator", "libXScrnSaver"]
-      }
-      else {
-        depends = []
-      }
-    }
-    else if (!Array.isArray(depends)) {
-      // noinspection SuspiciousTypeOfGuard
-      if (typeof depends === "string") {
-        depends = [depends as string]
-      }
-      else {
-        throw new Error(`depends must be Array or String, but specified as: ${depends}`)
-      }
+    const fpmConfiguration: FpmConfiguration = {
+      args, target,
     }
 
-    for (const dep of depends) {
-      args.push("--depends", dep)
+    if (options.compression != null) {
+      fpmConfiguration.compression = options.compression
+    }
+
+    // noinspection JSDeprecatedSymbols
+    const depends = options.depends
+    if (depends != null) {
+      if (Array.isArray(depends)) {
+        fpmConfiguration.customDepends = depends
+      }
+      else {
+        // noinspection SuspiciousTypeOfGuard
+        if (typeof depends === "string") {
+          fpmConfiguration.customDepends = [depends as string]
+        }
+        else {
+          throw new Error(`depends must be Array or String, but specified as: ${depends}`)
+        }
+      }
     }
 
     use(packager.info.metadata.license, it => args.push("--license", it!))
@@ -202,22 +180,27 @@ export default class FpmTarget extends Target {
 
     args.push(`${appOutDir}/=${installPrefix}/${appInfo.productFilename}`)
     for (const icon of (await this.helper.icons)) {
-      args.push(`${icon.file}=/usr/share/icons/hicolor/${icon.size}x${icon.size}/apps/${packager.executableName}.png`)
+      const extWithDot = path.extname(icon.file)
+      const sizeName = extWithDot === ".svg" ? "scalable" : `${icon.size}x${icon.size}`
+      args.push(`${icon.file}=/usr/share/icons/hicolor/${sizeName}/apps/${packager.executableName}${extWithDot}`)
+    }
+
+    const mimeTypeFilePath = await this.helper.mimeTypeFiles
+    if (mimeTypeFilePath != null) {
+      args.push(`${mimeTypeFilePath}=/usr/share/mime/packages/${packager.executableName}.xml`)
     }
 
     const desktopFilePath = await this.helper.writeDesktopEntry(this.options)
-    args.push(`${desktopFilePath}=/usr/share/applications/${this.packager.executableName}.desktop`)
+    args.push(`${desktopFilePath}=/usr/share/applications/${packager.executableName}.desktop`)
 
-    if (this.packager.packagerOptions.effectiveOptionComputed != null && await this.packager.packagerOptions.effectiveOptionComputed([args, desktopFilePath])) {
+    if (packager.packagerOptions.effectiveOptionComputed != null && await packager.packagerOptions.effectiveOptionComputed([args, desktopFilePath])) {
       return
     }
 
     const env = {
       ...process.env,
-      FPM_COMPRESS_PROGRAM: appBuilderPath,
       SZA_PATH: path7za,
       SZA_COMPRESSION_LEVEL: packager.compression === "store" ? "0" : "9",
-      SZA_ARCHIVE_TYPE: "xz",
     }
 
     // rpmbuild wants directory rpm with some default config files. Even if we can use dylibbundler, path to such config files are not changed (we need to replace in the binary)
@@ -229,10 +212,18 @@ export default class FpmTarget extends Target {
         DYLD_LIBRARY_PATH: computeEnv(process.env.DYLD_LIBRARY_PATH, [path.join(linuxToolsPath, "lib")]),
       })
     }
-    await exec(await fpmPath.value, args, {env})
 
-    this.packager.dispatchArtifactCreated(artifactPath, this, arch)
+    await executeAppBuilder(["fpm", "--configuration", JSON.stringify(fpmConfiguration)], undefined, {env})
+
+    await packager.dispatchArtifactCreated(artifactPath, this, arch)
   }
+}
+
+interface FpmConfiguration {
+  target: string
+  args: Array<string>
+  customDepends?: Array<string>
+  compression?: string | null
 }
 
 async function writeConfigFile(tmpDir: TmpDir, templatePath: string, options: any): Promise<string> {

@@ -1,13 +1,11 @@
 import { AllPublishOptions, newError } from "builder-util-runtime"
 import { execFileSync, spawn } from "child_process"
-import isDev from "electron-is-dev"
-import { chmod, unlinkSync } from "fs-extra-p"
+import { chmod } from "fs-extra"
+import { unlinkSync } from "fs"
 import * as path from "path"
-import "source-map-support/register"
 import { DownloadUpdateOptions } from "./AppUpdater"
-import { BaseUpdater } from "./BaseUpdater"
+import { BaseUpdater, InstallOptions } from "./BaseUpdater"
 import { FileWithEmbeddedBlockMapDifferentialDownloader } from "./differentialDownloader/FileWithEmbeddedBlockMapDifferentialDownloader"
-import { UpdateCheckResult } from "./main"
 import { findFile } from "./providers/Provider"
 
 export class AppImageUpdater extends BaseUpdater {
@@ -15,11 +13,7 @@ export class AppImageUpdater extends BaseUpdater {
     super(options, app)
   }
 
-  checkForUpdatesAndNotify(): Promise<UpdateCheckResult | null> {
-    if (isDev) {
-      return Promise.resolve(null)
-    }
-
+  public isUpdaterActive(): boolean {
     if (process.env.APPIMAGE == null) {
       if (process.env.SNAP == null) {
         this._logger.warn("APPIMAGE env is not defined, current application is not an AppImage")
@@ -27,17 +21,16 @@ export class AppImageUpdater extends BaseUpdater {
       else {
         this._logger.info("SNAP env is defined, updater is disabled")
       }
-      return Promise.resolve(null)
+      return false
     }
-
-    return super.checkForUpdatesAndNotify()
+    return super.isUpdaterActive()
   }
 
   /*** @private */
-  protected async doDownloadUpdate(downloadUpdateOptions: DownloadUpdateOptions): Promise<Array<string>> {
-    const provider = await this.provider
-    const fileInfo = findFile(provider.resolveFiles(downloadUpdateOptions.updateInfo), "AppImage")!!
-    return await this.executeDownload({
+  protected doDownloadUpdate(downloadUpdateOptions: DownloadUpdateOptions): Promise<Array<string>> {
+    const provider = downloadUpdateOptions.updateInfoAndProvider.provider
+    const fileInfo = findFile(provider.resolveFiles(downloadUpdateOptions.updateInfoAndProvider.info), "AppImage")!!
+    return this.executeDownload({
       fileExtension: "AppImage",
       fileInfo,
       downloadUpdateOptions,
@@ -50,11 +43,11 @@ export class AppImageUpdater extends BaseUpdater {
         let isDownloadFull = false
         try {
           await new FileWithEmbeddedBlockMapDifferentialDownloader(fileInfo.info, this.httpExecutor, {
-            newUrl: fileInfo.url.href,
+            newUrl: fileInfo.url,
             oldFile,
             logger: this._logger,
             newFile: updateFile,
-            useMultipleRangeRequest: provider.useMultipleRangeRequest,
+            isUseMultipleRangeRequest: provider.isUseMultipleRangeRequest,
             requestHeaders: downloadUpdateOptions.requestHeaders,
           })
             .download()
@@ -66,7 +59,7 @@ export class AppImageUpdater extends BaseUpdater {
         }
 
         if (isDownloadFull) {
-          await this.httpExecutor.download(fileInfo.url.href, updateFile, downloadOptions)
+          await this.httpExecutor.download(fileInfo.url, updateFile, downloadOptions)
         }
 
         await chmod(updateFile, 0o755)
@@ -74,7 +67,7 @@ export class AppImageUpdater extends BaseUpdater {
     })
   }
 
-  protected async doInstall(installerPath: string, isSilent: boolean, isRunAfter: boolean): Promise<boolean> {
+  protected doInstall(options: InstallOptions): boolean {
     const appImageFile = process.env.APPIMAGE!!
     if (appImageFile == null) {
       throw newError("APPIMAGE env is not defined", "ERR_UPDATER_OLD_FILE_NOT_FOUND")
@@ -87,22 +80,22 @@ export class AppImageUpdater extends BaseUpdater {
     const existingBaseName = path.basename(appImageFile)
     // https://github.com/electron-userland/electron-builder/issues/2964
     // if no version in existing file name, it means that user wants to preserve current custom name
-    if (path.basename(installerPath) === existingBaseName || !/\d+\.\d+\.\d+/.test(existingBaseName)) {
+    if (path.basename(options.installerPath) === existingBaseName || !/\d+\.\d+\.\d+/.test(existingBaseName)) {
       // no version in the file name, overwrite existing
       destination = appImageFile
     }
     else {
-      destination = path.join(path.dirname(appImageFile), path.basename(installerPath))
+      destination = path.join(path.dirname(appImageFile), path.basename(options.installerPath))
     }
 
-    execFileSync("mv", ["-f", installerPath, destination])
+    execFileSync("mv", ["-f", options.installerPath, destination])
 
     const env: any = {
       ...process.env,
       APPIMAGE_SILENT_INSTALL: "true",
     }
 
-    if (isRunAfter) {
+    if (options.isForceRunAfter) {
       spawn(destination, [], {
         detached: true,
         stdio: "ignore",

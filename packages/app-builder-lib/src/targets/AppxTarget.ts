@@ -1,19 +1,19 @@
 import BluebirdPromise from "bluebird-lst"
-import { Arch, asArray, InvalidConfigurationError, log, deepAssign } from "builder-util"
+import { Arch, asArray, deepAssign, InvalidConfigurationError, log } from "builder-util"
 import { copyOrLinkFile, walk } from "builder-util/out/fs"
-import { emptyDir, readdir, readFile, writeFile } from "fs-extra-p"
+import { emptyDir, readdir, readFile, writeFile } from "fs-extra"
 import * as path from "path"
 import { AppXOptions } from "../"
+import { getSignVendorPath, isOldWin6 } from "../codeSign/windowsCodeSign"
 import { Target } from "../core"
 import { getTemplatePath } from "../util/pathManager"
 import { VmManager } from "../vm/vm"
-import { getSignVendorPath, isOldWin6 } from "../windowsCodeSign"
 import { WinPackager } from "../winPackager"
 import { createStageDir } from "./targetUtil"
 
 const APPX_ASSETS_DIR_NAME = "appx"
 
-const vendorAssetsForDefaultAssets: { [key: string]: string; } = {
+const vendorAssetsForDefaultAssets: { [key: string]: string } = {
   "StoreLogo.png": "SampleAppx.50x50.png",
   "Square150x150Logo.png": "SampleAppx.150x150.png",
   "Square44x44Logo.png": "SampleAppx.44x44.png",
@@ -36,9 +36,13 @@ export default class AppXTarget extends Target {
   // https://docs.microsoft.com/en-us/windows/uwp/packaging/create-app-package-with-makeappx-tool#mapping-files
   async build(appOutDir: string, arch: Arch): Promise<any> {
     const packager = this.packager
-    const artifactName = packager.expandArtifactNamePattern(this.options, "appx", arch)
+    const artifactName = packager.expandArtifactBeautyNamePattern(this.options, "appx", arch)
     const artifactPath = path.join(this.outDir, artifactName)
-    this.logBuilding("AppX", artifactPath, arch)
+    await packager.info.callArtifactBuildStarted({
+      targetPresentableName: "AppX",
+      file: artifactPath,
+      arch,
+    })
 
     const vendorPath = await getSignVendorPath()
     const vm = await packager.vm.value
@@ -69,12 +73,14 @@ export default class AppXTarget extends Target {
 
     const manifestFile = stageDir.getTempFile("AppxManifest.xml")
     await this.writeManifest(manifestFile, arch, await this.computePublisherName(), userAssets)
+    await packager.info.callAppxManifestCreated(manifestFile)
     mappingList.push(assetInfo.mappings)
     mappingList.push([`"${vm.toVmFile(manifestFile)}" "AppxManifest.xml"`])
+    const signToolArch = (arch === Arch.arm64 ? "x64" : Arch[arch])
 
     if (isScaledAssetsProvided(userAssets)) {
       const outFile = vm.toVmFile(stageDir.getTempFile("resources.pri"))
-      const makePriPath = vm.toVmFile(path.join(vendorPath, "windows-10", Arch[arch], "makepri.exe"))
+      const makePriPath = vm.toVmFile(path.join(vendorPath, "windows-10", signToolArch, "makepri.exe"))
 
       const assetRoot = stageDir.getTempFile("appx/assets")
       await emptyDir(assetRoot)
@@ -105,12 +111,12 @@ export default class AppXTarget extends Target {
     if (this.options.makeappxArgs != null) {
       makeAppXArgs.push(...this.options.makeappxArgs)
     }
-    await vm.exec(vm.toVmFile(path.join(vendorPath, "windows-10", Arch[arch], "makeappx.exe")), makeAppXArgs)
+    await vm.exec(vm.toVmFile(path.join(vendorPath, "windows-10", signToolArch, "makeappx.exe")), makeAppXArgs)
     await packager.sign(artifactPath)
 
     await stageDir.cleanup()
 
-    packager.info.dispatchArtifactCreated({
+    await packager.info.callArtifactBuildCompleted({
       file: artifactPath,
       packager,
       arch,
@@ -154,8 +160,9 @@ export default class AppXTarget extends Target {
       return this.options.publisher || "CN=ms"
     }
 
-    const publisher = await this.packager.computedPublisherSubjectOnWindowsOnly.value
-    if (!publisher) {
+    const certInfo = await this.packager.lazyCertInfo.value
+    const publisher = certInfo == null ? null : certInfo.bloodyMicrosoftSubjectDn
+    if (publisher == null) {
       throw new Error("Internal error: cannot compute subject using certificate info")
     }
     return publisher
@@ -166,23 +173,26 @@ export default class AppXTarget extends Target {
     const options = this.options
     const executable = `app\\${appInfo.productFilename}.exe`
     const displayName = options.displayName || appInfo.productName
+    const extensions = await this.getExtensions(executable, displayName)
+
     const manifest = (await readFile(path.join(getTemplatePath("appx"), "appxmanifest.xml"), "utf8"))
       .replace(/\${([a-zA-Z0-9]+)}/g, (match, p1): string => {
         switch (p1) {
           case "publisher":
             return publisher
 
-          case "publisherDisplayName":
+          case "publisherDisplayName": {
             const name = options.publisherDisplayName || appInfo.companyName
             if (name == null) {
               throw new InvalidConfigurationError(`Please specify "author" in the application package.json — it is required because "appx.publisherDisplayName" is not set.`)
             }
             return name
+          }
 
           case "version":
-            return appInfo.getVersionInWeirdWindowsForm(false)
+            return appInfo.getVersionInWeirdWindowsForm(options.setBuildNumber === true)
 
-          case "applicationId":
+          case "applicationId": {
             const result = options.applicationId || options.identityName || appInfo.name
             if (!isNaN(parseInt(result[0], 10))) {
               let message = `AppX Application.Id can’t start with numbers: "${result}"`
@@ -192,9 +202,10 @@ export default class AppXTarget extends Target {
               throw new InvalidConfigurationError(message)
             }
             return result
+          }
 
           case "identityName":
-            return options.identityName  || appInfo.name
+            return options.identityName || appInfo.name
 
           case "executable":
             return executable
@@ -221,19 +232,25 @@ export default class AppXTarget extends Target {
             return lockScreenTag(userAssets)
 
           case "defaultTile":
-            return defaultTileTag(userAssets)
+            return defaultTileTag(userAssets, options.showNameOnTiles || false)
 
           case "splashScreen":
             return splashScreenTag(userAssets)
 
           case "arch":
-            return arch === Arch.ia32 ? "x86" : "x64"
+            return arch === Arch.ia32 ? "x86" : (arch === Arch.arm64 ? "arm64" : "x64")
 
           case "resourceLanguages":
             return resourceLanguageTag(asArray(options.languages))
 
           case "extensions":
-            return this.getExtensions(executable, displayName)
+            return extensions
+
+          case "minVersion":
+            return arch === Arch.arm64 ? "10.0.16299.0" : "10.0.14316.0"
+
+          case "maxVersionTested":
+            return arch === Arch.arm64 ? "10.0.16299.0" : "10.0.14316.0"
 
           default:
             throw new Error(`Macro ${p1} is not defined`)
@@ -242,9 +259,12 @@ export default class AppXTarget extends Target {
     await writeFile(outFile, manifest)
   }
 
-  private getExtensions(executable: string, displayName: string): string {
+  private async getExtensions(executable: string, displayName: string): Promise<string> {
     const uriSchemes = asArray(this.packager.config.protocols)
       .concat(asArray(this.packager.platformSpecificBuildOptions.protocols))
+
+    const fileAssociations = asArray(this.packager.config.fileAssociations)
+      .concat(asArray(this.packager.platformSpecificBuildOptions.fileAssociations))
 
     let isAddAutoLaunchExtension = this.options.addAutoLaunchExtension
     if (isAddAutoLaunchExtension === undefined) {
@@ -252,7 +272,10 @@ export default class AppXTarget extends Target {
       isAddAutoLaunchExtension = deps != null && deps["electron-winstore-auto-launch"] != null
     }
 
-    if (!isAddAutoLaunchExtension && uriSchemes.length === 0) {
+    if (!isAddAutoLaunchExtension
+      && uriSchemes.length === 0
+      && fileAssociations.length === 0
+      && this.options.customExtensionsPath === undefined) {
       return ""
     }
 
@@ -274,6 +297,24 @@ export default class AppXTarget extends Target {
              </uap:Protocol>
           </uap:Extension>`
       }
+    }
+
+    for (const fileAssociation of fileAssociations) {
+      for (const ext of asArray(fileAssociation.ext)) {
+        extensions += `
+          <uap:Extension Category="windows.fileTypeAssociation">
+            <uap:FileTypeAssociation Name="${ext}">
+              <uap:SupportedFileTypes>
+                <uap:FileType>.${ext}</uap:FileType>
+              </uap:SupportedFileTypes>
+            </uap:FileTypeAssociation>
+          </uap:Extension>`
+      }
+    }
+
+    if (this.options.customExtensionsPath !== undefined) {
+      const extensionsPath = path.resolve(this.packager.info.appDir, this.options.customExtensionsPath)
+      extensions += await readFile(extensionsPath, "utf8")
     }
 
     extensions += "</Extensions>"
@@ -298,7 +339,7 @@ function lockScreenTag(userAssets: Array<string>): string {
   }
 }
 
-function defaultTileTag(userAssets: Array<string>): string {
+function defaultTileTag(userAssets: Array<string>, showNameOnTiles: boolean): string {
   const defaultTiles: Array<string> = ["<uap:DefaultTile", 'Wide310x150Logo="assets\\Wide310x150Logo.png"']
 
   if (isDefaultAssetIncluded(userAssets, "LargeTile.png")) {
@@ -308,7 +349,16 @@ function defaultTileTag(userAssets: Array<string>): string {
     defaultTiles.push('Square71x71Logo="assets\\SmallTile.png"')
   }
 
-  defaultTiles.push("/>")
+  if (showNameOnTiles) {
+    defaultTiles.push(">")
+    defaultTiles.push("<uap:ShowNameOnTiles>")
+    defaultTiles.push("<uap:ShowOn", 'Tile="wide310x150Logo"', "/>")
+    defaultTiles.push("<uap:ShowOn", 'Tile="square150x150Logo"', "/>")
+    defaultTiles.push("</uap:ShowNameOnTiles>")
+    defaultTiles.push("</uap:DefaultTile>")
+  } else {
+    defaultTiles.push("/>")
+  }
   return defaultTiles.join(" ")
 }
 

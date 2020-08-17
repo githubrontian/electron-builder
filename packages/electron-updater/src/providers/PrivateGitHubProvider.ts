@@ -1,20 +1,20 @@
-import { CancellationToken, GithubOptions, HttpError, HttpExecutor, newError, UpdateInfo } from "builder-util-runtime"
+import { CancellationToken, GithubOptions, HttpError, newError, UpdateInfo } from "builder-util-runtime"
 import { OutgoingHttpHeaders, RequestOptions } from "http"
 import { safeLoad } from "js-yaml"
 import * as path from "path"
 import { AppUpdater } from "../AppUpdater"
 import { URL } from "url"
 import { BaseGitHubProvider } from "./GitHubProvider"
-import { getChannelFilename, getDefaultChannelName, newUrlFromBase, ResolvedUpdateFileInfo } from "../main"
-import { getFileList } from "./Provider"
+import { getChannelFilename, newUrlFromBase, ResolvedUpdateFileInfo } from "../main"
+import { getFileList, ProviderRuntimeOptions } from "./Provider"
 
 export interface PrivateGitHubUpdateInfo extends UpdateInfo {
   assets: Array<Asset>
 }
 
 export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdateInfo> {
-  constructor(options: GithubOptions, private readonly updater: AppUpdater, private readonly token: string, executor: HttpExecutor<any>) {
-    super(options, "api.github.com", executor)
+  constructor(options: GithubOptions, private readonly updater: AppUpdater, private readonly token: string, runtimeOptions: ProviderRuntimeOptions) {
+    super(options, "api.github.com", runtimeOptions)
   }
 
   protected createRequestOptions(url: URL, headers?: OutgoingHttpHeaders | null): RequestOptions {
@@ -25,7 +25,7 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
 
   async getLatestVersion(): Promise<PrivateGitHubUpdateInfo> {
     const cancellationToken = new CancellationToken()
-    const channelFile = getChannelFilename(getDefaultChannelName())
+    const channelFile = getChannelFilename(this.getDefaultChannelName())
 
     const releaseInfo = await this.getLatestVersionInfo(cancellationToken)
     const asset = releaseInfo.assets.find(it => it.name === channelFile)
@@ -54,6 +54,7 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
     return this.configureHeaders("application/octet-stream")
   }
 
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
   private configureHeaders(accept: string) {
     return {
       accept,
@@ -62,27 +63,28 @@ export class PrivateGitHubProvider extends BaseGitHubProvider<PrivateGitHubUpdat
   }
 
   private async getLatestVersionInfo(cancellationToken: CancellationToken): Promise<ReleaseInfo> {
-    let basePath = this.basePath
     const allowPrerelease = this.updater.allowPrerelease
-
+    let basePath = this.basePath
     if (!allowPrerelease) {
       basePath = `${basePath}/latest`
     }
 
     const url = newUrlFromBase(basePath, this.baseUrl)
     try {
-      let version = (JSON.parse((await this.httpRequest(url, this.configureHeaders("application/vnd.github.v3+json"), cancellationToken))!!))
+      const version = (JSON.parse((await this.httpRequest(url, this.configureHeaders("application/vnd.github.v3+json"), cancellationToken))!!))
       if (allowPrerelease) {
-        version = version.find((v: any) => v.prerelease)
+        return version.find((v: any) => v.prerelease) || version[0]
       }
-      return version
+      else {
+        return version
+      }
     }
     catch (e) {
       throw newError(`Unable to find latest version on GitHub (${url}), please ensure a production release exists: ${e.stack || e.message}`, "ERR_UPDATER_LATEST_VERSION_NOT_FOUND")
     }
   }
 
-  private get basePath() {
+  private get basePath(): string {
     return this.computeGithubBasePath(`/repos/${this.options.owner}/${this.options.repo}/releases`)
   }
 

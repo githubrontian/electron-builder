@@ -3,13 +3,15 @@ import { BeforeBuildContext, Target } from "./core"
 import { ElectronDownloadOptions } from "./electron/ElectronFramework"
 import { AppXOptions } from "./options/AppXOptions"
 import { AppImageOptions, DebOptions, LinuxConfiguration, LinuxTargetSpecificOptions } from "./options/linuxOptions"
-import { DmgOptions, MacConfiguration, MasConfiguration, PkgOptions } from "./options/macOptions"
+import { DmgOptions, MacConfiguration, MasConfiguration } from "./options/macOptions"
 import { MsiOptions } from "./options/MsiOptions"
+import { PkgOptions } from "./options/pkgOptions"
 import { PlatformSpecificBuildOptions } from "./options/PlatformSpecificBuildOptions"
 import { SnapOptions } from "./options/SnapOptions"
 import { SquirrelWindowsOptions } from "./options/SquirrelWindowsOptions"
 import { WindowsConfiguration } from "./options/winOptions"
 import { BuildResult } from "./packager"
+import { ArtifactBuildStarted, ArtifactCreated } from "./packagerApi"
 import { PlatformPackager } from "./platformPackager"
 import { NsisOptions, NsisWebOptions, PortableOptions } from "./targets/nsis/nsisOptions"
 
@@ -46,6 +48,10 @@ export interface Configuration extends PlatformSpecificBuildOptions {
    * MAS (Mac Application Store) options.
    */
   readonly mas?: MasConfiguration | null
+  /**
+   * MAS (Mac Application Store) development options (`mas-dev` target).
+   */
+  readonly masDev?: MasConfiguration | null
   /**
    * macOS DMG options.
    */
@@ -110,15 +116,10 @@ export interface Configuration extends PlatformSpecificBuildOptions {
    * @default true
    */
   readonly npmRebuild?: boolean
-  /**
-   * @deprecated Please use npmBuildFromSource.
-   * @private
-   */
-  readonly npmSkipBuildFromSource?: boolean
 
   /**
    * The build version. Maps to the `CFBundleVersion` on macOS, and `FileVersion` metadata property on Windows. Defaults to the `version`.
-   * If `TRAVIS_BUILD_NUMBER` or `APPVEYOR_BUILD_NUMBER` or `CIRCLE_BUILD_NUM` or `BUILD_NUMBER` or `bamboo.buildNumber` env defined, it will be used as a build version (`version.build_number`).
+   * If `TRAVIS_BUILD_NUMBER` or `APPVEYOR_BUILD_NUMBER` or `CIRCLE_BUILD_NUM` or `BUILD_NUMBER` or `bamboo.buildNumber` or `CI_PIPELINE_IID` env defined, it will be used as a build version (`version.build_number`).
    */
   readonly buildVersion?: string | null
 
@@ -158,18 +159,23 @@ export interface Configuration extends PlatformSpecificBuildOptions {
    * Whether to fail if the application is not signed (to prevent unsigned app if code signing configuration is not correct).
    * @default false
    */
-  readonly ?: boolean
+  readonly forceCodeSigning?: boolean
 
   /**
-   * The version of muon you are packaging for.
+   * *libui-based frameworks only* The version of NodeJS you are packaging for.
+   * You can set it to `current` to set the Node.js version that you use to run.
    */
-  readonly muonVersion?: string | null
+  readonly nodeVersion?: string | null
 
   /**
-   * *Proton Native only* The version of NodeJS you are packaging for.
-   * You can set it to `current` to set the Node.js version that you use to run electron-builder.
+   * *libui-based frameworks only* The version of LaunchUI you are packaging for. Applicable for Windows only. Defaults to version suitable for used framework version.
    */
-  readonly protonNodeVersion?: string | null
+  readonly launchUiVersion?: boolean | string | null
+
+  /**
+   * The framework name. One of `electron`, `proton`, `libui`. Defaults to `electron`.
+   */
+  readonly framework?: string | null
 
   /**
    * The function (or path to file or module id) to be [run after pack](#afterpack) (but before pack into distributable format and sign).
@@ -179,10 +185,23 @@ export interface Configuration extends PlatformSpecificBuildOptions {
    * The function (or path to file or module id) to be [run after pack and sign](#aftersign) (but before pack into distributable format).
    */
   readonly afterSign?: ((context: AfterPackContext) => Promise<any> | any) | string | null
+
+  /**
+   * The function (or path to file or module id) to be run on artifact build start.
+   */
+  readonly artifactBuildStarted?: ((context: ArtifactBuildStarted) => Promise<any> | any) | string | null
+  /**
+   * The function (or path to file or module id) to be run on artifact build completed.
+   */
+  readonly artifactBuildCompleted?: ((context: ArtifactCreated) => Promise<any> | any) | string | null
   /**
    * The function (or path to file or module id) to be [run after all artifacts are build](#afterAllArtifactBuild).
    */
   readonly afterAllArtifactBuild?: ((context: BuildResult) => Promise<Array<string>> | Array<string>) | string | null
+  /**
+   * Appx manifest created on disk - not packed into .appx package yet.
+   */
+  readonly appxManifestCreated?: ((path: string) => Promise<any> | any) | string | null
   /**
    * The function (or path to file or module id) to be [run on each node module](#onnodemodulefile) file.
    */

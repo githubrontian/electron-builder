@@ -1,17 +1,12 @@
 import { createHash } from "crypto"
-import { emptyDir, readJson, remove } from "fs-extra-p"
-import isCi from "is-ci"
+import { emptyDir, readJson, realpathSync, remove } from "fs-extra"
+import { isCI as isCi } from "ci-info"
 import { tmpdir } from "os"
 import * as path from "path"
 import { deleteOldElectronVersion, downloadAllRequiredElectronVersions } from "./downloadElectron"
 
-const rootDir = path.join(__dirname, "../../..")
-
-const util = require(`${rootDir}/packages/builder-util/out/util`)
-const isEmptyOrSpaces = util.isEmptyOrSpaces
-
-const baseDir = process.env.ELECTRON_BUILDER_TMP_DIR || (process.platform === "darwin" && !require("is-ci") ? "/tmp" : tmpdir())
-const TEST_TMP_DIR = path.join(baseDir, `et-${createHash("md5").update(__dirname).digest("hex")}`)
+const baseDir = process.env.APP_BUILDER_TMP_DIR || realpathSync(tmpdir())
+const APP_BUILDER_TMP_DIR = path.join(baseDir, `et-${createHash("md5").update(__dirname).digest("hex")}`)
 
 runTests()
   .catch(error => {
@@ -23,23 +18,23 @@ async function runTests() {
   process.env.BABEL_JEST_SKIP = "true"
 
   if (process.env.CIRCLECI) {
-    await emptyDir(TEST_TMP_DIR)
+    await emptyDir(APP_BUILDER_TMP_DIR)
   }
   else {
     await Promise.all([
       deleteOldElectronVersion(),
       downloadAllRequiredElectronVersions(),
-      emptyDir(TEST_TMP_DIR),
+      emptyDir(APP_BUILDER_TMP_DIR),
     ])
   }
 
   const testFiles = process.env.TEST_FILES
 
   const testPatterns: Array<string> = []
-  if (!isEmptyOrSpaces(testFiles)) {
-    testPatterns.push(...testFiles!!.split(","))
+  if (testFiles != null && testFiles.length !== 0) {
+    testPatterns.push(...testFiles.split(","))
   }
-  else if (!isEmptyOrSpaces(process.env.CIRCLE_NODE_INDEX)) {
+  else if (process.env.CIRCLE_NODE_INDEX != null && process.env.CIRCLE_NODE_INDEX.length !== 0) {
     const circleNodeIndex = parseInt(process.env.CIRCLE_NODE_INDEX!!, 10)
     if (circleNodeIndex === 0) {
       testPatterns.push("debTest")
@@ -53,6 +48,7 @@ async function runTests() {
       testPatterns.push("extraMetadataTest")
       testPatterns.push("HoistedNodeModuleTest")
       testPatterns.push("configurationValidationTest")
+      testPatterns.push("webInstallerTest")
     }
     else if (circleNodeIndex === 1) {
       testPatterns.push("oneClickInstallerTest")
@@ -61,35 +57,34 @@ async function runTests() {
       testPatterns.push("snapTest")
       testPatterns.push("macPackagerTest")
       testPatterns.push("linuxPackagerTest")
-    }
-    else {
-      testPatterns.push("PublishManagerTest")
-      testPatterns.push("portableTest")
-      testPatterns.push("BuildTest")
-      testPatterns.push("assistedInstallerTest")
-      testPatterns.push("linuxArchiveTest")
-      testPatterns.push("filesTest")
-      testPatterns.push("globTest")
-      testPatterns.push("webInstallerTest")
       testPatterns.push("msiTest")
       testPatterns.push("ignoreTest")
       testPatterns.push("mainEntryTest")
       testPatterns.push("ArtifactPublisherTest")
       testPatterns.push("RepoSlugTest")
+      testPatterns.push("portableTest")
+      testPatterns.push("globTest")
+      testPatterns.push("BuildTest")
+      testPatterns.push("linuxArchiveTest")
+    }
+    else {
+      testPatterns.push("PublishManagerTest")
+      testPatterns.push("assistedInstallerTest")
+      testPatterns.push("filesTest")
+      testPatterns.push("protonTest")
     }
     console.log(`Test files for node ${circleNodeIndex}: ${testPatterns.join(", ")}`)
   }
 
-  process.env.TEST_TMP_DIR = TEST_TMP_DIR
+  process.env.APP_BUILDER_TMP_DIR = APP_BUILDER_TMP_DIR
 
-  const rootDir = path.join(__dirname, "..", "..", "..")
+  const rootDir = path.join(__dirname, "..", "..")
+
+  process.chdir(rootDir)
 
   const config = (await readJson(path.join(rootDir, "package.json"))).jest
   // use custom cache dir to avoid https://github.com/facebook/jest/issues/1903#issuecomment-261212137
   config.cacheDirectory = process.env.JEST_CACHE_DIR || "/tmp/jest-electron-builder-tests"
-  // no need to transform — compiled before
-  config.transform = {}
-  config.transformIgnorePatterns = [".*"]
   config.bail = process.env.TEST_BAIL === "true"
 
   let runInBand = false
@@ -120,16 +115,12 @@ async function runTests() {
       else if (scriptArg.startsWith("skip")) {
         if (!isCi) {
           const suffix = scriptArg.substring("skip".length)
-          switch (scriptArg) {
-            case "skipArtifactPublisher": {
-              testPathIgnorePatterns.push("[\\/]{1}ArtifactPublisherTest.js$")
-              config.cacheDirectory += `-${suffix}`
-            }
-              // noinspection TsLint
-              break
-
-            default:
-              throw new Error(`Unknown opt ${scriptArg}`)
+          if (scriptArg === "skipArtifactPublisher") {
+            testPathIgnorePatterns.push("[\\/]{1}ArtifactPublisherTest.js$")
+            config.cacheDirectory += `-${suffix}`
+          }
+          else {
+            throw new Error(`Unknown opt ${scriptArg}`)
           }
         }
       }
@@ -149,21 +140,21 @@ async function runTests() {
 
   if (testPatterns.length > 0) {
     jestOptions.testPathPattern = testPatterns
-      .map(it => it.endsWith(".js") || it.endsWith("*") ? it : `${it}\\.js$`)
+      .map(it => it.endsWith(".ts") || it.endsWith("*") ? it : `${it}\\.ts$`)
   }
   if (process.env.CIRCLECI != null || process.env.TEST_JUNIT_REPORT === "true") {
-    jestOptions.testResultsProcessor = "jest-junit"
+    jestOptions.reporters = ["default", "jest-junit"]
   }
 
   // console.log(JSON.stringify(jestOptions, null, 2))
 
-  const testResult = await require("jest-cli").runCLI(jestOptions, jestOptions.projects)
+  const testResult = await require("@jest/core").runCLI(jestOptions, jestOptions.projects)
   const exitCode = testResult.results == null || testResult.results.success ? 0 : testResult.globalConfig.testFailureExitCode
   if (isCi) {
     process.exit(exitCode)
   }
 
-  await remove(TEST_TMP_DIR)
+  await remove(APP_BUILDER_TMP_DIR)
   process.exitCode = exitCode
   if (testResult.globalConfig.forceExit) {
     process.exit(exitCode)

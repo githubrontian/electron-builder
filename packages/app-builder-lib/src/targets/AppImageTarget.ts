@@ -1,13 +1,13 @@
-import { Arch, executeAppBuilderAsJson, serializeToYaml } from "builder-util"
-import { outputFile } from "fs-extra-p"
+import { Arch, serializeToYaml } from "builder-util"
+import { outputFile } from "fs-extra"
 import { Lazy } from "lazy-val"
 import * as path from "path"
 import { AppImageOptions } from ".."
 import { Target } from "../core"
 import { LinuxPackager } from "../linuxPackager"
 import { getAppUpdatePublishConfiguration } from "../publish/PublishManager"
+import { executeAppBuilderAsJson, objectToArgs } from "../util/appBuilder"
 import { getNotLocalizedLicenseFile } from "../util/license"
-import { getTemplatePath } from "../util/pathManager"
 import { LinuxTargetHelper } from "./LinuxTargetHelper"
 import { createStageDir } from "./targetUtil"
 
@@ -19,7 +19,6 @@ export default class AppImageTarget extends Target {
   constructor(ignored: string, private readonly packager: LinuxPackager, private readonly helper: LinuxTargetHelper, readonly outDir: string) {
     super("appImage")
 
-    // we add X-AppImage-BuildId to ensure that new desktop file will be installed
     this.desktopEntry = new Lazy<string>(() => helper.computeDesktopEntry(this.options, "AppRun", {
       "X-AppImage-Version": `${packager.appInfo.buildVersion}`,
     }))
@@ -31,9 +30,13 @@ export default class AppImageTarget extends Target {
     // https://github.com/electron-userland/electron-builder/issues/775
     // https://github.com/electron-userland/electron-builder/issues/1726
     // tslint:disable-next-line:no-invalid-template-strings
-    const artifactName = packager.expandArtifactNamePattern(options, "AppImage", arch, "${name}-${version}-${arch}.${ext}", false)
+    const artifactName = packager.expandArtifactNamePattern(options, "AppImage", arch)
     const artifactPath = path.join(this.outDir, artifactName)
-    this.logBuilding("AppImage", artifactPath, arch)
+    await packager.info.callArtifactBuildStarted({
+      targetPresentableName: "AppImage",
+      file: artifactPath,
+      arch,
+    })
 
     const c = await Promise.all([
       this.desktopEntry.value,
@@ -43,7 +46,7 @@ export default class AppImageTarget extends Target {
       createStageDir(this, packager, arch),
     ])
     const license = c[3]
-    const stageDir = c[4]
+    const stageDir = c[4]!!
 
     const publishConfig = c[2]
     if (publishConfig != null) {
@@ -60,24 +63,24 @@ export default class AppImageTarget extends Target {
       "--arch", Arch[arch],
       "--output", artifactPath,
       "--app", appOutDir,
-      "--template", path.join(getTemplatePath("linux"), "AppRun.sh"),
       "--configuration", (JSON.stringify({
         productName: this.packager.appInfo.productName,
+        productFilename: this.packager.appInfo.productFilename,
         desktopEntry: c[0],
         executableName: this.packager.executableName,
-        systemIntegration: options.systemIntegration || "ask",
         icons: c[1],
         fileAssociations: this.packager.fileAssociations,
+        ...options,
       })),
     ]
+    objectToArgs(args, {
+      license,
+    })
     if (packager.compression === "maximum") {
       args.push("--compression", "xz")
     }
-    if (license != null) {
-      args.push("--license", license)
-    }
 
-    packager.info.dispatchArtifactCreated({
+    await packager.info.callArtifactBuildCompleted({
       file: artifactPath,
       safeArtifactName: packager.computeSafeArtifactName(artifactName, "AppImage", arch, false),
       target: this,
